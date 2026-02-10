@@ -1,0 +1,12 @@
+# video_downloader_api/api/v1/routes/health.py
+
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health_check() -> dict:
+    return {"status": "ok"}
