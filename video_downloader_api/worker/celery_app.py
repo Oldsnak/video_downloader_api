@@ -1,10 +1,7 @@
-# video_downloader_api/worker/celery_app.py
-
 from __future__ import annotations
 
 from celery import Celery
-
-from video_downloader_api.core.config import get_settings  # ✅ FIXED
+from video_downloader_api.core.config import get_settings
 
 settings = get_settings()
 
@@ -19,5 +16,5 @@ celery_app.conf.task_routes = {
     "worker.tasks.run_download": {"queue": "downloads"},
 }
 
-# important: tasks module load
-celery_app.autodiscover_tasks(["video_downloader_api.worker"])
+# ✅ simplest: directly import tasks so they register
+import video_downloader_api.worker.tasks  # noqa: F401

@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from video_downloader_api.core.logger import get_logger
 from video_downloader_api.db.session import SessionLocal
-from .celery_app import celery_app
+from video_downloader_api.worker.celery_app import celery_app
 
 logger = get_logger("worker.tasks")
 
