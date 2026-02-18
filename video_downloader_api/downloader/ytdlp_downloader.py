@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from logging import Logger
 from typing import Any, Callable, Dict, List, Optional
 
@@ -12,14 +13,19 @@ from video_downloader_api.core.logger import get_logger
 from video_downloader_api.downloader.base import BaseDownloader
 
 
+def _has_ffmpeg() -> bool:
+    # yt-dlp uses ffmpeg/ffprobe for merging audio+video.
+    return shutil.which("ffmpeg") is not None
+
+
 class YtDlpDownloader(BaseDownloader):
     """
     Concrete downloader implementation using yt-dlp.
 
-    Supports:
-    - extract_info(url): fetch metadata without downloading
-    - list_formats(info): return available formats
-    - download(...): download a chosen format and report progress via callback
+    Notes:
+    - For YouTube, many formats are *video-only* (no audio). If you download those directly,
+      you will get a file with no sound.
+    - If ffmpeg is available, we can ask yt-dlp to download video+audio and merge.
     """
 
     def __init__(self, logger: Optional[Logger] = None) -> None:
@@ -56,6 +62,30 @@ class YtDlpDownloader(BaseDownloader):
             return []
         return formats
 
+    def _build_format_selector(self, format_id: str) -> str:
+        """
+        Convert a user-selected format_id into a yt-dlp `format` selector.
+
+        - If caller already passes a selector (contains '/' or '+') we keep it.
+        - Otherwise:
+            - if ffmpeg exists: request `format_id+bestaudio/best` (ensures audio)
+            - else: request `format_id/best` (best-effort without merge)
+        """
+        fmt = (format_id or "").strip()
+        if not fmt:
+            return "best"
+
+        # If it already looks like an expression, trust it.
+        if any(x in fmt for x in ("+", "/")):
+            return fmt
+
+        if _has_ffmpeg():
+            # Prefer merging with best audio when selected format is video-only.
+            return f"{fmt}+bestaudio/best"
+
+        # No ffmpeg: cannot merge, but at least fall back to something playable.
+        return f"{fmt}/best"
+
     def download(
         self,
         url: str,
@@ -77,32 +107,36 @@ class YtDlpDownloader(BaseDownloader):
             os.makedirs(out_dir, exist_ok=True)
 
         def _hook(d: Dict[str, Any]) -> None:
-            # yt-dlp sends progress updates as dict
             try:
                 progress_cb(d)
             except Exception:
-                # Do not crash download due to progress callback issues
                 self.logger.exception("Progress callback failed (job may still continue).")
+
+        fmt_selector = self._build_format_selector(format_id)
 
         ydl_opts: Dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            # Choose exact format:
-            "format": format_id,
+            # Choose format (may be selector expression)
+            "format": fmt_selector,
             # Write exactly to this path:
             "outtmpl": output_path,
             # Progress updates:
             "progress_hooks": [_hook],
-            # Reduce noisy files:
+            # Resume/retry
             "continuedl": True,
             "retries": 3,
         }
+
+        # If ffmpeg exists, tell yt-dlp to output a single mp4 after merging.
+        if _has_ffmpeg():
+            ydl_opts["merge_output_format"] = "mp4"
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
             return output_path
         except Exception as e:
-            self.logger.exception("yt-dlp download failed for url=%s format_id=%s", url, format_id)
+            self.logger.exception("yt-dlp download failed for url=%s format=%s", url, fmt_selector)
             raise RuntimeError(f"Failed to download video: {e}") from e
