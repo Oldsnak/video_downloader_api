@@ -49,14 +49,21 @@ class DownloadService:
             raise ValueError("Domain is not allowed.")
         platform = self.detector.detect_platform(normalized)
 
-        # (Optional) You can validate the URL is extractable by calling metadata.validate_and_extract
-        # but that can be slow; keeping it light here.
+        quality = None
+        s = (format_id or "").strip()
+        if s.lower() == "best":
+            quality = "best"
+        elif s.isdigit():
+            quality = f"{s}p"
+        elif s and s[-1].lower() == "p" and s[:-1].isdigit():
+            quality = s  # e.g. "720p"
+
         repo = self.repo_factory()
         job = repo.create_job(
             source_url=normalized,
             platform=platform,
             format_id=format_id,
-            quality=None,  # We'll set it later when we match the format during download
+            quality=quality,
         )
 
         # Enqueue Celery task
@@ -70,13 +77,14 @@ class DownloadService:
 
         status_url = f"{self.settings.API_V1_PREFIX}/download/status/{job.id}"
         stream_url = f"{self.settings.API_V1_PREFIX}/download/stream/{job.id}"
+        file_url = f"{self.settings.API_V1_PREFIX}/files/{job.id}"
 
         return DownloadStartResponse(
             job_id=job.id,
             status=job.status,
             status_url=status_url,
             stream_url=stream_url,
-            file_url=None,
+            file_url=file_url,
         )
 
     def get_status(self, job_id: str) -> JobStatusOut:

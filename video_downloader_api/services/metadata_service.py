@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from video_downloader_api.core.logger import get_logger
 from video_downloader_api.downloader.base import BaseDownloader
@@ -11,24 +11,32 @@ from video_downloader_api.services.platform_detector import PlatformDetector
 from video_downloader_api.utils.helpers import bytes_to_human, safe_int
 
 
-def quality_label(fmt: Dict[str, Any]) -> str:
-    """
-    Build a quality label like 360p, 720p from yt-dlp format dict.
-    """
-    h = fmt.get("height")
-    if isinstance(h, int) and h > 0:
-        return f"{h}p"
-
-    # fallback: try format_note or resolution
-    note = fmt.get("format_note")
-    if note:
-        return str(note)
-
-    res = fmt.get("resolution")
-    if res:
-        return str(res)
-
+def quality_label_from_height(height: Optional[int]) -> str:
+    """Build quality label like 360p, 720p from height."""
+    if isinstance(height, int) and height > 0:
+        return f"{height}p"
     return "unknown"
+
+
+def _height(fmt: Dict[str, Any]) -> Optional[int]:
+    """Extract height from format dict."""
+    h = fmt.get("height")
+    return safe_int(h, default=None) if h is not None else None
+
+
+def _has_video(fmt: Dict[str, Any]) -> bool:
+    vcodec = fmt.get("vcodec")
+    return vcodec is not None and str(vcodec).lower() != "none"
+
+
+def _has_audio(fmt: Dict[str, Any]) -> bool:
+    acodec = fmt.get("acodec")
+    return acodec is not None and str(acodec).lower() != "none"
+
+
+def _is_merged(fmt: Dict[str, Any]) -> bool:
+    """True if this format has both video and audio (single file)."""
+    return _has_video(fmt) and _has_audio(fmt)
 
 
 class MetadataService:
@@ -63,7 +71,10 @@ class MetadataService:
 
     def get_video_info(self, url: str, allowed_domains: List[str]) -> VideoInfoOut:
         """
-        Returns clean API response containing video metadata + formats list with sizes.
+        Returns clean API response containing video metadata + one format per quality.
+        Deduplicates YouTube/Instagram formats (no more 3 sizes per 720p). Prefers
+        merged (video+audio) formats; for separate streams we use format_id = height
+        so the downloader merges bestvideo+bestaudio at download time.
         """
         platform, normalized_url, info = self.validate_and_extract(url, allowed_domains)
 
@@ -73,37 +84,52 @@ class MetadataService:
 
         raw_formats = self.downloader.list_formats(info)
 
-        formats_out: List[VideoFormatOut] = []
+        # Group by height (resolution). For each height keep at most one format:
+        # prefer merged (video+audio), then video-only (we'll merge at download time).
+        # Key: height (int), Value: (format_dict, is_merged)
+        by_height: Dict[int, Tuple[Dict[str, Any], bool]] = {}
 
         for fmt in raw_formats:
             if not isinstance(fmt, dict):
                 continue
-
-            # yt-dlp sometimes returns entries without usable IDs
-            format_id = fmt.get("format_id")
-            if not format_id:
+            if not _has_video(fmt):
                 continue
-
-            # Skip non-video or special formats
-            vcodec = fmt.get("vcodec")
-            if vcodec in (None, "none"):
-                continue
-
-            # Optional: skip storyboard formats (youtube can include these)
             if fmt.get("format_note") == "storyboard":
                 continue
 
-            ext = fmt.get("ext") or "mp4"
-            acodec = fmt.get("acodec")
+            height = _height(fmt)
+            if height is None or height <= 0:
+                continue
 
-            # filesize may be in different keys
+            merged = _is_merged(fmt)
+            existing = by_height.get(height)
+            # Prefer merged (video+audio) over video-only
+            if existing is not None:
+                existing_merged = existing[1]
+                if existing_merged and not merged:
+                    continue  # keep existing merged
+                if not existing_merged and merged:
+                    by_height[height] = (fmt, merged)  # replace with merged
+                # else keep existing (both merged or both video-only)
+                continue
+            by_height[height] = (fmt, merged)
+
+        formats_out: List[VideoFormatOut] = []
+        for height in sorted(by_height.keys()):
+            fmt, _ = by_height[height]
+            quality = quality_label_from_height(height)
+            # Use height as format_id so downloader can use bestvideo[height<=H]+bestaudio
+            format_id = str(height)
+            ext = fmt.get("ext") or "mp4"
+            vcodec = fmt.get("vcodec")
+            acodec = fmt.get("acodec")
             filesize = fmt.get("filesize") or fmt.get("filesize_approx")
             filesize_bytes = safe_int(filesize, default=None)
 
             formats_out.append(
                 VideoFormatOut(
-                    format_id=str(format_id),
-                    quality=quality_label(fmt),
+                    format_id=format_id,
+                    quality=quality,
                     ext=str(ext),
                     filesize_bytes=filesize_bytes,
                     filesize_human=bytes_to_human(filesize_bytes),
@@ -113,14 +139,20 @@ class MetadataService:
                 )
             )
 
-        # Sort by numeric quality when possible: 360p < 720p < 1080p
-        def _sort_key(v: VideoFormatOut) -> int:
-            q = (v.quality or "").lower().strip()
-            if q.endswith("p"):
-                return safe_int(q[:-1], default=0) or 0
-            return 0
-
-        formats_out.sort(key=_sort_key)
+        # Add "best" option (let yt-dlp choose)
+        formats_out.insert(
+            0,
+            VideoFormatOut(
+                format_id="best",
+                quality="best",
+                ext="mp4",
+                filesize_bytes=None,
+                filesize_human=None,
+                fps=None,
+                vcodec=None,
+                acodec=None,
+            ),
+        )
 
         return VideoInfoOut(
             title=str(title) if title else None,

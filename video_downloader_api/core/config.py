@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     DOWNLOAD_DIR: str = "downloads"
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_FILE_SIZE_MB: int = 2000
+    # SaaS: delete file after it is streamed to client (no long-term storage)
+    DELETE_FILE_AFTER_STREAM: bool = True
 
     # -------------------------
     # Redis + DB
