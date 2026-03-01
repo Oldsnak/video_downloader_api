@@ -6,13 +6,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from video_downloader_api.core.logger import get_logger
 from video_downloader_api.downloader.base import BaseDownloader
-from video_downloader_api.schemas.video import VideoInfoOut, VideoFormatOut
+from video_downloader_api.schemas.video import PlaylistInfoOut, VideoFormatOut, VideoInfoOut
 from video_downloader_api.services.platform_detector import PlatformDetector
 from video_downloader_api.utils.helpers import bytes_to_human, safe_int
 
 
 def quality_label_from_height(height: Optional[int]) -> str:
-    """Build quality label like 360p, 720p from height."""
+    """Build quality label like 360p, 720p from height.".\.venv\Scripts\activate"""
     if isinstance(height, int) and height > 0:
         return f"{height}p"
     return "unknown"
@@ -67,6 +67,22 @@ class MetadataService:
 
         platform = self.detector.detect_platform(normalized)
         info = self.downloader.extract_info(normalized)
+        return platform, normalized, info
+
+    def validate_and_extract_playlist(
+        self, url: str, allowed_domains: List[str]
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        """
+        Same as [validate_and_extract] but keeps playlist structure (no noplaylist)
+        so that we can list all entries for a playlist URL.
+        """
+        normalized = self.detector.normalize_url(url)
+
+        if not self.detector.is_allowed_domain(normalized, allowed_domains):
+            raise ValueError("Domain is not allowed.")
+
+        platform = self.detector.detect_platform(normalized)
+        info = self.downloader.extract_playlist(normalized)
         return platform, normalized, info
 
     def get_video_info(self, url: str, allowed_domains: List[str]) -> VideoInfoOut:
@@ -161,4 +177,38 @@ class MetadataService:
             platform=platform,
             source_url=normalized_url,
             formats=formats_out,
+        )
+
+    def get_playlist_info(self, url: str, allowed_domains: List[str]) -> PlaylistInfoOut:
+        """
+        Returns metadata for all videos in a playlist URL.
+        Internally reuses [get_video_info] for each entry so the response shape
+        matches the single-video API (VideoInfoOut per item).
+        """
+        platform, normalized_url, info = self.validate_and_extract_playlist(url, allowed_domains)
+
+        title = info.get("title")
+        entries = info.get("entries") or []
+        videos: List[VideoInfoOut] = []
+
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_url = entry.get("url") or entry.get("webpage_url")
+                if not entry_url:
+                    continue
+                try:
+                    vinfo = self.get_video_info(str(entry_url), allowed_domains)
+                    videos.append(vinfo)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to build VideoInfoOut for playlist entry url=%s", entry_url
+                    )
+                    continue
+
+        return PlaylistInfoOut(
+            title=str(title) if title else None,
+            playlist_url=normalized_url,
+            videos=videos,
         )

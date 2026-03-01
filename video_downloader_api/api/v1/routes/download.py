@@ -17,7 +17,7 @@ from video_downloader_api.schemas.download import (
     LinkCheckRequest,
     LinkCheckResponse,
 )
-from video_downloader_api.schemas.video import VideoInfoOut
+from video_downloader_api.schemas.video import PlaylistInfoOut, VideoInfoOut
 from video_downloader_api.services.download_service import DownloadService
 from video_downloader_api.services.metadata_service import MetadataService
 from video_downloader_api.services.platform_detector import PlatformDetector
@@ -82,6 +82,28 @@ def get_info(payload: LinkCheckRequest, db: Session = Depends(get_db)) -> VideoI
 
     try:
         return metadata.get_video_info(url_str, allowed_domains=settings.ALLOWED_DOMAINS)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post(
+    "/playlist-info",
+    response_model=PlaylistInfoOut,
+    dependencies=[Depends(verify_api_key)],
+)
+def get_playlist_info(payload: LinkCheckRequest, db: Session = Depends(get_db)) -> PlaylistInfoOut:
+    """
+    Returns metadata (title, thumbnail, formats) for each video in a playlist URL.
+    """
+    settings, _, metadata, _ = _build_services(db)
+
+    url_str = str(payload.url)
+    validate_url_safe(url_str)
+
+    try:
+        return metadata.get_playlist_info(url_str, allowed_domains=settings.ALLOWED_DOMAINS)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:

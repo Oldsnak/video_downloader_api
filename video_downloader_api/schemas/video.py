@@ -51,3 +51,16 @@ class VideoInfoOut(BaseModel):
         default_factory=list,
         description="Available downloadable formats for the video.",
     )
+
+
+class PlaylistInfoOut(BaseModel):
+    """
+    Metadata for a playlist URL, containing multiple videos.
+    """
+
+    title: Optional[str] = Field(default=None, description="Playlist title if available.")
+    playlist_url: str = Field(..., description="Normalized playlist URL.")
+    videos: List[VideoInfoOut] = Field(
+        default_factory=list,
+        description="Videos contained in the playlist (each with its own formats).",
+    )

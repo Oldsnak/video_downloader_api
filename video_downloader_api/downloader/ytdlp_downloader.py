@@ -79,6 +79,27 @@ class YtDlpDownloader(BaseDownloader):
             self.logger.exception("yt-dlp extract_info failed for url=%s", url)
             raise RuntimeError(f"Failed to extract video info: {e}") from e
 
+    def extract_playlist(self, url: str) -> Dict[str, Any]:
+        """
+        Extract high-level playlist information (entries) without downloading.
+        Used for playlist metadata; does not change single-video behavior.
+        """
+        ydl_opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": False,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info or {}
+        except Exception as e:
+            self.logger.exception("yt-dlp extract_playlist failed for url=%s", url)
+            raise RuntimeError(f"Failed to extract playlist info: {e}") from e
+
     def list_formats(self, info: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Returns formats list from yt-dlp info dict.
