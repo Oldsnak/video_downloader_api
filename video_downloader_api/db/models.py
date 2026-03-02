@@ -35,6 +35,7 @@ class DownloadJob(Base):
 
     format_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     quality: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
     downloaded_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

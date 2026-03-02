@@ -120,7 +120,11 @@ def start_download(payload: DownloadStartRequest, db: Session = Depends(get_db))
     validate_url_safe(payload.url)
 
     try:
-        return download_service.create_job(url=payload.url, format_id=payload.format_id)
+        return download_service.create_job(
+            url=payload.url,
+            format_id=payload.format_id,
+            filename_hint=payload.filename_hint,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:

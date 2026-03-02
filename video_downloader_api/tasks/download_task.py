@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 from sqlalchemy.orm import Session
@@ -54,8 +55,12 @@ def execute_download(job_id: str, db: Session) -> None:
     repo.update_status(job_id, "downloading", error=None)
 
     try:
-        # Choose extension based on format if you want (default mp4)
-        output_path = storage.build_output_path(job_id=job_id, ext="mp4")
+        # Output path: use video title when available so saved file has original name
+        output_path = storage.build_output_path(
+            job_id=job_id,
+            ext="mp4",
+            title=job.title,
+        )
 
         # Cleanup old partials if any
         file_manager.cleanup_job_files(job_id=job_id, base_dir=settings.DOWNLOAD_DIR)
@@ -68,9 +73,12 @@ def execute_download(job_id: str, db: Session) -> None:
             progress_cb=lambda hook: progress_service.handle_hook(job_id, hook),
         )
 
+        # Store canonical absolute path so API and worker agree (fixes 404 when CWD differs)
+        final_path_abs = os.path.normpath(os.path.abspath(final_path))
+
         # Set finished status + file info
         public_url = storage.public_url_for(job_id)
-        repo.set_file(job_id=job_id, file_path=final_path, public_url=public_url)
+        repo.set_file(job_id=job_id, file_path=final_path_abs, public_url=public_url)
         repo.update_status(job_id, "finished", error=None)
 
         # Final event

@@ -12,6 +12,8 @@ from video_downloader_api.api.v1.api_router import api_router
 from video_downloader_api.core.config import get_settings
 from video_downloader_api.core.logger import get_logger
 
+from sqlalchemy import text
+
 from video_downloader_api.db.models import Base
 from video_downloader_api.db.session import engine
 
@@ -40,6 +42,19 @@ async def lifespan(app: FastAPI):
         logger.info("✅ DB tables ensured.")
     except Exception as e:
         logger.exception("❌ Failed to create DB tables: %s", e)
+
+    # ✅ Migration: add 'title' column to download_jobs if missing (existing DBs)
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in (settings.DATABASE_URL or "").lower():
+                r = conn.execute(text("PRAGMA table_info(download_jobs)"))
+                columns = [row[1] for row in r]
+                if "title" not in columns:
+                    conn.execute(text("ALTER TABLE download_jobs ADD COLUMN title VARCHAR(512)"))
+                    conn.commit()
+                    logger.info("✅ Added 'title' column to download_jobs.")
+    except Exception as e:
+        logger.exception("⚠️ Migration (title column) skipped or failed: %s", e)
 
     yield
 

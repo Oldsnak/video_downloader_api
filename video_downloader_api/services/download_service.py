@@ -36,7 +36,12 @@ class DownloadService:
         self.settings = get_settings()
         self.logger = get_logger(self.__class__.__name__)
 
-    def create_job(self, url: str, format_id: str) -> DownloadStartResponse:
+    def create_job(
+        self,
+        url: str,
+        format_id: str,
+        filename_hint: Optional[str] = None,
+    ) -> DownloadStartResponse:
         """
         Creates DB job (queued) and enqueues Celery task.
 
@@ -64,6 +69,7 @@ class DownloadService:
             platform=platform,
             format_id=format_id,
             quality=quality,
+            title=filename_hint.strip() if filename_hint and filename_hint.strip() else None,
         )
 
         # Enqueue Celery task

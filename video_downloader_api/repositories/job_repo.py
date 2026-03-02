@@ -30,6 +30,7 @@ class JobRepository:
         platform: str,
         format_id: Optional[str],
         quality: Optional[str],
+        title: Optional[str] = None,
     ) -> DownloadJob:
         job = DownloadJob(
             source_url=source_url,
@@ -37,6 +38,7 @@ class JobRepository:
             status="queued",
             format_id=format_id,
             quality=quality,
+            title=title,
             downloaded_bytes=0,
             total_bytes=None,
             speed_bps=None,

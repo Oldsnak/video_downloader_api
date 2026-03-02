@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import List, Optional, Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _project_root() -> str:
+    """Directory that contains the video_downloader_api package. Same for API and worker."""
+    _here = os.path.dirname(os.path.abspath(__file__))  # core/
+    _pkg = os.path.dirname(_here)  # video_downloader_api/
+    return os.path.dirname(_pkg)  # project root
 
 
 def _parse_list(v: Any) -> List[str]:
@@ -90,6 +98,18 @@ class Settings(BaseSettings):
     # Downloads
     # -------------------------
     DOWNLOAD_DIR: str = "downloads"
+
+    @field_validator("DOWNLOAD_DIR", mode="after")
+    @classmethod
+    def _resolve_download_dir_absolute(cls, v: str) -> str:
+        """Resolve to same absolute path for API and worker (fixes 404 when worker CWD differs)."""
+        if not v or not isinstance(v, str):
+            return os.path.join(_project_root(), "downloads")
+        v = v.strip()
+        if not os.path.isabs(v):
+            v = os.path.join(_project_root(), v)
+        return os.path.abspath(v)
+
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_FILE_SIZE_MB: int = 2000
     # SaaS: delete file after it is streamed to client (no long-term storage)

@@ -10,12 +10,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from video_downloader_api.core.config import get_settings
+from video_downloader_api.core.logger import get_logger
 from video_downloader_api.db.session import get_db
 from video_downloader_api.middleware.auth import verify_api_key
 from video_downloader_api.repositories.job_repo import JobRepository
 from video_downloader_api.services.storage_service import StorageService
 
 router = APIRouter(prefix="/files")
+logger = get_logger("files.route")
 
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
@@ -59,9 +61,44 @@ def get_file(job_id: str, db: Session = Depends(get_db)):
 
     storage = StorageService(base_dir=settings.DOWNLOAD_DIR)
     file_path = job.file_path or storage.build_output_path(job_id)
+    file_path = os.path.normpath(os.path.abspath(file_path)) if file_path else None
 
     if not file_path or not os.path.isfile(file_path):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server.")
+        # Fallback 1: try default path (downloads/<job_id>.mp4)
+        fallback_path = storage.build_output_path(job_id)
+        if os.path.isfile(fallback_path):
+            logger.info("get_file: job_id=%s served from fallback path; db_path=%s", job_id, job.file_path)
+            file_path = fallback_path
+            try:
+                repo.set_file(
+                    job_id=job_id,
+                    file_path=file_path,
+                    public_url=storage.public_url_for(job_id),
+                )
+            except Exception as e:
+                logger.warning("get_file: could not update job file_path for job_id=%s: %s", job_id, e)
+        else:
+            # Fallback 2: scan download dir for any file matching job_id (yt-dlp may use different name)
+            file_path = storage.find_file_by_job_id(job_id)
+            if file_path:
+                logger.info(
+                    "get_file: job_id=%s served from scan; db_path=%s found=%s",
+                    job_id, job.file_path, file_path,
+                )
+                try:
+                    repo.set_file(
+                        job_id=job_id,
+                        file_path=file_path,
+                        public_url=storage.public_url_for(job_id),
+                    )
+                except Exception as e:
+                    logger.warning("get_file: could not update job file_path for job_id=%s: %s", job_id, e)
+            else:
+                logger.warning(
+                    "get_file: job_id=%s file not found; db_path=%s resolved=%s fallback_path=%s",
+                    job_id, job.file_path, file_path, fallback_path,
+                )
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found on server.")
 
     filename = os.path.basename(file_path)
     media_type = "application/octet-stream"
