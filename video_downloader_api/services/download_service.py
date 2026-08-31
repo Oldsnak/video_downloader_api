@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 from video_downloader_api.core.config import get_settings
@@ -131,8 +132,27 @@ class DownloadService:
             quality=job.quality,
             progress=progress,
             file_path=job.file_path,
+            filename=self._resolve_filename(job),
             public_url=public_url,
             error=job.error,
             created_at=job.created_at,
             updated_at=job.updated_at,
         )
+
+    def _resolve_filename(self, job) -> Optional[str]:
+        """Name the /files endpoint will serve, resolved the same way that route does.
+
+        Clients need this before the transfer starts: a background downloader must be
+        given a stable target name so an interrupted attempt can resume into the same
+        file instead of failing on a name collision.
+        """
+        if job.status != "finished":
+            return None
+
+        candidates = [job.file_path, self.storage.build_output_path(job.id)]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return os.path.basename(candidate)
+
+        scanned = self.storage.find_file_by_job_id(job.id)
+        return os.path.basename(scanned) if scanned else None

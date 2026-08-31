@@ -6,4 +6,13 @@ class Platform(str, Enum):
     INSTAGRAM = "instagram"
     FACEBOOK = "facebook"
     TIKTOK = "tiktok"
+
+    # Adult sites reachable from the app's 18+ section.
+    PORNHUB = "pornhub"
+    XHAMSTER = "xhamster"
+    XNXX = "xnxx"
+    XVIDEOS = "xvideos"
+    DESITALES = "desitales"
+    DARKERO = "darkero"
+
     UNKNOWN = "unknown"

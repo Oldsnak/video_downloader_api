@@ -12,7 +12,7 @@ from video_downloader_api.utils.helpers import bytes_to_human, safe_int
 
 
 def quality_label_from_height(height: Optional[int]) -> str:
-    """Build quality label like 360p, 720p from height.".\.venv\Scripts\activate"""
+    """Build quality label like 360p, 720p from height."""
     if isinstance(height, int) and height > 0:
         return f"{height}p"
     return "unknown"
@@ -37,6 +37,20 @@ def _has_audio(fmt: Dict[str, Any]) -> bool:
 def _is_merged(fmt: Dict[str, Any]) -> bool:
     """True if this format has both video and audio (single file)."""
     return _has_video(fmt) and _has_audio(fmt)
+
+
+def _estimate_size_bytes(tbr_kbps: Optional[float], duration_sec: Optional[int]) -> Optional[int]:
+    """
+    Approximate size from average bitrate (kbit/s) and duration.
+
+    Only used when the extractor reports no size at all, so the quality picker can
+    still show roughly how large a quality is instead of nothing.
+    """
+    if not tbr_kbps or not duration_sec:
+        return None
+    if tbr_kbps <= 0 or duration_sec <= 0:
+        return None
+    return int(tbr_kbps * 1000 / 8 * duration_sec)
 
 
 class MetadataService:
@@ -96,6 +110,7 @@ class MetadataService:
 
         title = info.get("title")
         duration = info.get("duration")
+        duration_sec = safe_int(duration, default=None)
         thumbnail = info.get("thumbnail")
 
         raw_formats = self.downloader.list_formats(info)
@@ -104,6 +119,11 @@ class MetadataService:
         # prefer merged (video+audio), then video-only (we'll merge at download time).
         # Key: height (int), Value: (format_dict, is_merged)
         by_height: Dict[int, Tuple[Dict[str, Any], bool]] = {}
+
+        # Some sites (Pornhub) report no size on the progressive formats we pick, but
+        # do report a bitrate on the HLS variant of the same resolution. Keeping the
+        # bitrate per height lets us estimate a size instead of showing none.
+        tbr_by_height: Dict[int, float] = {}
 
         for fmt in raw_formats:
             if not isinstance(fmt, dict):
@@ -116,6 +136,11 @@ class MetadataService:
             height = _height(fmt)
             if height is None or height <= 0:
                 continue
+
+            tbr = fmt.get("tbr")
+            if isinstance(tbr, (int, float)) and tbr > 0:
+                if tbr > tbr_by_height.get(height, 0.0):
+                    tbr_by_height[height] = float(tbr)
 
             merged = _is_merged(fmt)
             existing = by_height.get(height)
@@ -142,13 +167,24 @@ class MetadataService:
             filesize = fmt.get("filesize") or fmt.get("filesize_approx")
             filesize_bytes = safe_int(filesize, default=None)
 
+            estimated = False
+            if filesize_bytes is None:
+                filesize_bytes = _estimate_size_bytes(
+                    tbr_by_height.get(height), duration_sec
+                )
+                estimated = filesize_bytes is not None
+
+            filesize_human = bytes_to_human(filesize_bytes)
+            if filesize_human and estimated:
+                filesize_human = f"~{filesize_human}"
+
             formats_out.append(
                 VideoFormatOut(
                     format_id=format_id,
                     quality=quality,
                     ext=str(ext),
                     filesize_bytes=filesize_bytes,
-                    filesize_human=bytes_to_human(filesize_bytes),
+                    filesize_human=filesize_human,
                     fps=safe_int(fmt.get("fps"), default=None),
                     vcodec=str(vcodec) if vcodec else None,
                     acodec=str(acodec) if acodec else None,
@@ -172,7 +208,7 @@ class MetadataService:
 
         return VideoInfoOut(
             title=str(title) if title else None,
-            duration_sec=safe_int(duration, default=None),
+            duration_sec=duration_sec,
             thumbnail=str(thumbnail) if thumbnail else None,
             platform=platform,
             source_url=normalized_url,

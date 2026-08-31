@@ -13,8 +13,16 @@ sqlalchemy==2.0.46
 celery==5.6.2
 redis==7.1.1
 
-# Video downloading
-yt-dlp==2026.2.4
+# Video downloading (keep recent — TikTok/Instagram break often)
+yt-dlp==2026.7.4
+# YouTube JS challenge solver (required for resolutions above 360p)
+yt-dlp-ejs>=0.8.0
+# Browser impersonation for TikTok JS challenges and adult sites that reject
+# non-browser TLS fingerprints with "410 Gone" (Pornhub).
+# Upper bound is not cosmetic: yt-dlp only loads its curl_cffi backend for
+# 0.5.10 and 0.10.x-0.15.x. On any other version impersonation silently becomes
+# unavailable and those sites start failing.
+curl-cffi>=0.10,<0.16
 
 # File uploads / form handling (FastAPI dependency)
 python-multipart

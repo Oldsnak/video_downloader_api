@@ -35,6 +35,10 @@ class JobStatusOut(BaseModel):
 
     progress: Optional[ProgressOut] = Field(default=None, description="Progress details if downloading.")
     file_path: Optional[str] = Field(default=None, description="Local path to downloaded file (server-side).")
+    filename: Optional[str] = Field(
+        default=None,
+        description="Name the finished file is served with, so the client can pick its save name up front.",
+    )
     public_url: Optional[str] = Field(default=None, description="Public URL to download the file from this API.")
     error: Optional[str] = Field(default=None, description="Error message if job failed.")
 

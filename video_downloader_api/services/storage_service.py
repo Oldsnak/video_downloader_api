@@ -3,27 +3,12 @@
 from __future__ import annotations
 
 import os
-import re
 from typing import Optional
 
 from video_downloader_api.core.config import get_settings
+from video_downloader_api.utils.filename_sanitize import build_download_basename
 
 _VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".m4a", ".opus")
-
-
-def _sanitize_filename_part(title: Optional[str], max_length: int = 120) -> Optional[str]:
-    """Make a safe filename fragment from video title (no path chars, length limited)."""
-    if not title or not title.strip():
-        return None
-    s = title.strip()
-    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", s)
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip()
-    if not s:
-        return None
-    if len(s) > max_length:
-        s = s[:max_length].strip()
-    return s if s else None
 
 
 class StorageService:
@@ -52,12 +37,7 @@ class StorageService:
         If title is provided, filename is <sanitized_title>_<job_id>.<ext>, else <job_id>.<ext>.
         """
         self.ensure_dirs()
-        safe_ext = (ext or "mp4").lstrip(".").strip() or "mp4"
-        safe_title = _sanitize_filename_part(title)
-        if safe_title:
-            filename = f"{safe_title}_{job_id}.{safe_ext}"
-        else:
-            filename = f"{job_id}.{safe_ext}"
+        filename = build_download_basename(job_id=job_id, ext=ext or "mp4", title=title)
         return os.path.abspath(os.path.join(self.base_dir, filename))
 
     def find_file_by_job_id(self, job_id: str) -> Optional[str]:

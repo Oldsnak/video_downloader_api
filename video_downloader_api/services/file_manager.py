@@ -27,7 +27,7 @@ class FileManager:
     def cleanup_job_files(self, job_id: str, base_dir: str) -> None:
         """
         Cleanup leftover / partial files for a job.
-        Handles both <job_id>.<ext> and <title>_<job_id>.<ext> naming.
+        Handles <job_id>.<ext> and <sanitized_title>_<digits>_<job_id>.<ext> naming.
         """
         if not os.path.isdir(base_dir):
             return

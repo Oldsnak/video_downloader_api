@@ -27,11 +27,12 @@ class PlatformDetector:
             raw = "https://" + raw
 
         parsed = urlparse(raw)
+        # The host is deliberately left as-is, including any "www." prefix: this URL
+        # is handed to yt-dlp, and some sites (Pornhub) serve a JS bot-challenge page
+        # on the apex domain while the www host returns the real page. Platform
+        # detection and the domain allowlist strip "www." on their own, so keeping it
+        # here does not affect matching.
         netloc = parsed.netloc.lower()
-
-        # Strip leading www.
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
 
         # Remove tracking params
         tracking_keys = {
@@ -64,6 +65,17 @@ class PlatformDetector:
         )
         return normalized
 
+    # Adult sites use many country/language subdomains (e.g. rt.pornhub.com,
+    # xh.video mirrors), so these are matched on the registrable domain.
+    _ADULT_DOMAINS = {
+        "pornhub.com": Platform.PORNHUB,
+        "xhamster.com": Platform.XHAMSTER,
+        "xnxx.com": Platform.XNXX,
+        "xvideos.com": Platform.XVIDEOS,
+        "desitales2.com": Platform.DESITALES,
+        "darkero.com": Platform.DARKERO,
+    }
+
     def detect_platform(self, url: str) -> str:
         """
         Returns platform string based on hostname.
@@ -81,6 +93,10 @@ class PlatformDetector:
             return Platform.FACEBOOK.value
         if host == "tiktok.com" or host.endswith(".tiktok.com"):
             return Platform.TIKTOK.value
+
+        for domain, platform in self._ADULT_DOMAINS.items():
+            if host == domain or host.endswith("." + domain):
+                return platform.value
 
         return Platform.UNKNOWN.value
 

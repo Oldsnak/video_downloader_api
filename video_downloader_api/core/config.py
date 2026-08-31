@@ -91,6 +91,13 @@ class Settings(BaseSettings):
             "facebook.com",
             "fb.watch",
             "tiktok.com",
+            # Adult sites offered in the app's 18+ section
+            "pornhub.com",
+            "xhamster.com",
+            "xnxx.com",
+            "xvideos.com",
+            "desitales2.com",
+            "darkero.com",
         ]
     )
 
@@ -110,6 +117,24 @@ class Settings(BaseSettings):
             v = os.path.join(_project_root(), v)
         return os.path.abspath(v)
 
+    # yt-dlp: optional cookies for Instagram / TikTok (login-gated or sensitive content).
+    # YTDLP_COOKIES_FILE=/path/to/instagram.txt (Instagram only — not used for TikTok)
+    # YTDLP_INSTAGRAM_COOKIES_FILE=/path/to/instagram.txt (optional override)
+    # YTDLP_TIKTOK_COOKIES_FILE=/path/to/tiktok.txt (optional, login-gated TikTok only)
+    YTDLP_COOKIES_FILE: Optional[str] = Field(default=None)
+    YTDLP_INSTAGRAM_COOKIES_FILE: Optional[str] = Field(default=None)
+    YTDLP_TIKTOK_COOKIES_FILE: Optional[str] = Field(default=None)
+    YTDLP_COOKIES_FILES: Optional[str] = Field(default=None)
+    YTDLP_COOKIES_FROM_BROWSER: Optional[str] = Field(default=None)
+    # If false, Instagram/TikTok skip cookiesfrombrowser after cookie files (no Edge/Chrome rotation).
+    # Set when browser cookies always fail (DPAPI, locked DB) and you use YTDLP_COOKIES_FILE only.
+    YTDLP_TRY_BROWSER_COOKIES: bool = Field(default=True)
+    # Optional explicit path to ffmpeg.exe (when not on PATH or blocked from auto-detect).
+    FFMPEG_PATH: Optional[str] = Field(default=None)
+    # YouTube: optional path to deno.exe for yt-dlp EJS challenge solving (recommended).
+    # If unset, yt-dlp looks for deno on PATH; pip package yt-dlp-ejs is still required.
+    YTDLP_DENO_PATH: Optional[str] = Field(default=None)
+
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_FILE_SIZE_MB: int = 2000
     # SaaS: delete file after it is streamed to client (no long-term storage)
@@ -124,6 +149,8 @@ class Settings(BaseSettings):
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+    # Dev on Windows: run download tasks in-process (no Redis / Celery worker required).
+    CELERY_TASK_ALWAYS_EAGER: bool = Field(default=False)
 
     # -------------------------
     # Security
