@@ -13,6 +13,12 @@ export PATH="${HOME}/.deno/bin:${PATH}"
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
+if ! command -v cloudflared >/dev/null 2>&1; then
+  sudo curl -fsSL -o /usr/local/bin/cloudflared \
+    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+  sudo chmod +x /usr/local/bin/cloudflared
+fi
+
 mkdir -p downloads
 if [ ! -f .env ]; then
   cp .env.codespace .env
