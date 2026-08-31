@@ -7,6 +7,18 @@ import queue
 import threading
 from typing import Dict, Iterator, Optional
 
+_default: Optional["EventsService"] = None
+_default_lock = threading.Lock()
+
+
+def get_events() -> "EventsService":
+    """Process-wide bus so the SSE route and the download thread share subscribers."""
+    global _default
+    with _default_lock:
+        if _default is None:
+            _default = EventsService()
+        return _default
+
 
 class EventsService:
     """
@@ -54,7 +66,12 @@ class EventsService:
 
         try:
             while True:
-                payload = q.get()  # blocks until an event arrives
+                try:
+                    payload = q.get(timeout=15)
+                except queue.Empty:
+                    # Keep-alive so Cloudflare / proxies do not idle-drop the SSE socket.
+                    yield {"job_id": job_id, "type": "ping"}
+                    continue
                 yield payload
         finally:
             # Cleanup subscriber on disconnect

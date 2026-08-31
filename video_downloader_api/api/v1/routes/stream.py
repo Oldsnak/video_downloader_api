@@ -9,14 +9,14 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from video_downloader_api.middleware.auth import verify_api_key
-from video_downloader_api.services.events_service import EventsService
+from video_downloader_api.services.events_service import get_events
 
 router = APIRouter(prefix="/download")
 
 # NOTE:
 # This is an in-memory events bus.
 # For real production (separate worker process), replace EventsService with Redis pubsub.
-events = EventsService()
+events = get_events()
 
 
 @router.get("/stream/{job_id}", dependencies=[Depends(verify_api_key)])
@@ -30,4 +30,12 @@ def stream_progress(job_id: str) -> StreamingResponse:
         for payload in events.subscribe(job_id):
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

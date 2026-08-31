@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from video_downloader_api.core.config import get_settings
 from video_downloader_api.core.logger import get_logger
@@ -42,6 +42,7 @@ class DownloadService:
         url: str,
         format_id: str,
         filename_hint: Optional[str] = None,
+        client_cookies: Optional[Sequence[object]] = None,
     ) -> DownloadStartResponse:
         """
         Creates DB job (queued) and enqueues Celery task.
@@ -73,14 +74,17 @@ class DownloadService:
             title=filename_hint.strip() if filename_hint and filename_hint.strip() else None,
         )
 
-        # Enqueue Celery task
-        try:
-            from video_downloader_api.worker.tasks import run_download  # local import avoids import cycles at startup
+        if client_cookies:
+            from video_downloader_api.services.client_cookies import persist_client_cookies
 
-            run_download.delay(job.id)
+            persist_client_cookies(job.id, client_cookies)
+
+        try:
+            from video_downloader_api.services.job_runner import enqueue_download
+
+            enqueue_download(job.id)
         except Exception:
-            self.logger.exception("Failed to enqueue Celery task for job_id=%s", job.id)
-            # We still return job_id; status will stay queued and user can retry later.
+            self.logger.exception("Failed to enqueue download for job_id=%s", job.id)
 
         status_url = f"{self.settings.API_V1_PREFIX}/download/status/{job.id}"
         stream_url = f"{self.settings.API_V1_PREFIX}/download/stream/{job.id}"

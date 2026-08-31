@@ -6,15 +6,16 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from functools import lru_cache
 from logging import Logger
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import yt_dlp  # pip install yt-dlp
 
-from video_downloader_api.core.config import get_settings
+from video_downloader_api.core.config import _project_root, get_settings
 from video_downloader_api.core.logger import get_logger
 from video_downloader_api.downloader.base import BaseDownloader
 
@@ -30,13 +31,15 @@ def _format_selector(format_id: str, *, merge: bool = True) -> str:
     """
     format_id = (format_id or "").strip()
     if not format_id or format_id.lower() == "best":
-        return "bestvideo+bestaudio/best" if merge else "best"
+        # bv* includes video-only and some combined streams; required for YouTube
+        # formats that are not tagged as strict video-only.
+        return "bv*+ba/b" if merge else "best"
 
     match = re.match(r"^(\d+)p?$", format_id, re.IGNORECASE)
     if match:
         height = match.group(1)
         if merge:
-            return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+            return f"bv*[height<={height}]+ba/b[height<={height}]"
         return f"best[height<={height}]"
 
     # Unknown (e.g., TikTok single-format id): use as-is; may be a single stream
@@ -76,8 +79,11 @@ def _is_youtube_url(url: str) -> bool:
     return h in ("youtube.com", "youtu.be") or h.endswith(".youtube.com")
 
 
-# Sites that answer a non-browser TLS/HTTP fingerprint with "410 Gone" instead of
-# the page. Impersonating a real browser is what gets past it.
+# Adult sites fingerprint-block non-browser TLS with 410/empty formats.
+# YouTube must NOT be impersonated when using exported cookies — that combo
+# makes yt-dlp report "The page needs to be reloaded".
+# TikTok must NOT get an extra ImpersonateTarget("chrome"): curl_cffi then
+# sends a Chrome 140–149 UA, and TikTok returns a bot page instead of the video.
 _IMPERSONATE_DOMAINS = (
     "pornhub.com",
     "pornhub.org",
@@ -87,12 +93,110 @@ _IMPERSONATE_DOMAINS = (
     "xvideos.com",
     "desitales2.com",
     "darkero.com",
+    "instagram.com",
 )
+
+# TikTok currently blocks the Chrome 140–149 UA window that curl_cffi impersonate
+# uses by default. Chrome 139 (or 130 / 150+) plus a www.tiktok.com Referer works.
+_TIKTOK_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.tiktok.com/",
+}
 
 
 def _needs_impersonation(url: str) -> bool:
     h = _host(url)
     return any(h == d or h.endswith("." + d) for d in _IMPERSONATE_DOMAINS)
+
+
+def _normalize_proxy_url(raw: str) -> Optional[str]:
+    s = (raw or "").strip().strip('"').strip("'").rstrip("/")
+    if not s:
+        return None
+    if "://" not in s:
+        s = "http://" + s
+    parsed = urlparse(s)
+    if not parsed.hostname:
+        return None
+    return s
+
+
+def _proxy_pool() -> Tuple[str, ...]:
+    """HTTP proxies from env. Credentials stay in settings; never log the password."""
+    settings = get_settings()
+    seen: set[str] = set()
+    out: List[str] = []
+
+    def add(raw: Optional[str]) -> None:
+        normalized = _normalize_proxy_url(raw or "")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+
+    add(getattr(settings, "YTDLP_PROXY", None))
+    csv = (getattr(settings, "YTDLP_PROXIES", None) or "").strip()
+    if csv:
+        for part in csv.split(","):
+            add(part)
+
+    user = (getattr(settings, "YTDLP_PROXY_USER", None) or "").strip()
+    password = (getattr(settings, "YTDLP_PROXY_PASSWORD", None) or "").strip()
+    endpoints = (getattr(settings, "YTDLP_PROXY_ENDPOINTS", None) or "").strip()
+    if user and password and endpoints:
+        for part in endpoints.split(","):
+            hostport = part.strip()
+            if not hostport:
+                continue
+            if "://" in hostport:
+                parsed = urlparse(hostport)
+                host = parsed.hostname or ""
+                port = parsed.port
+                if host and port:
+                    add(f"http://{user}:{password}@{host}:{port}")
+            else:
+                add(f"http://{user}:{password}@{hostport}")
+    return tuple(out)
+
+
+_PROXY_RR_LOCK = threading.Lock()
+_PROXY_RR_INDEX = 0
+_MAX_PROXY_ATTEMPTS = 5
+
+
+def _ordered_proxies() -> List[Optional[str]]:
+    """Round-robin start so concurrent jobs spread across the Webshare pool."""
+    pool = _proxy_pool()
+    if not pool:
+        return [None]
+    global _PROXY_RR_INDEX
+    with _PROXY_RR_LOCK:
+        start = _PROXY_RR_INDEX % len(pool)
+        _PROXY_RR_INDEX += 1
+    ordered = list(pool[start:] + pool[:start])
+    return ordered[:_MAX_PROXY_ATTEMPTS]
+
+
+def _proxy_label(proxy: Optional[str]) -> str:
+    if not proxy:
+        return "direct"
+    parsed = urlparse(proxy)
+    host = parsed.hostname or "?"
+    port = parsed.port
+    return f"{host}:{port}" if port else host
+
+
+def _short_err(message: str, limit: int = 120) -> str:
+    text = " ".join((message or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _apply_proxy(opts: Dict[str, Any], proxy: Optional[str]) -> None:
+    opts.pop("proxy", None)
+    if proxy:
+        opts["proxy"] = proxy
 
 
 @lru_cache(maxsize=1)
@@ -118,6 +222,23 @@ def _impersonate_target() -> Optional[Any]:
     return ImpersonateTarget("chrome")
 
 
+def _is_pornhub_url(url: str) -> bool:
+    h = _host(url)
+    return h in ("pornhub.com", "pornhub.org", "pornhub.net") or h.endswith(
+        (".pornhub.com", ".pornhub.org", ".pornhub.net")
+    )
+
+
+def _resolve_cookie_path(path: Optional[str]) -> Optional[str]:
+    p = (path or "").strip().strip('"').strip("'")
+    if not p:
+        return None
+    if not os.path.isabs(p):
+        p = os.path.join(_project_root(), p)
+    p = os.path.normpath(p)
+    return p if os.path.isfile(p) else None
+
+
 def _url_prefers_login_cookies(url: str) -> bool:
     """Instagram / TikTok often need cookies for gated or sensitive posts."""
     return _is_instagram_url(url) or _is_tiktok_url(url)
@@ -126,34 +247,34 @@ def _url_prefers_login_cookies(url: str) -> bool:
 def _cookie_file_pool(url: str) -> List[str]:
     """
     Cookie files for a specific URL/platform.
-    YTDLP_COOKIES_FILE is treated as Instagram-only so IG session cookies
-    are not sent to TikTok (they can trigger anti-bot failures).
+
+    Do not mix Instagram cookies into TikTok, or Instagram-only files into
+    YouTube — each site needs its own logged-in Netscape export.
     """
     settings = get_settings()
     seen: set[str] = set()
     out: List[str] = []
 
     def add(path: Optional[str]) -> None:
-        p = (path or "").strip()
-        if p and os.path.isfile(p) and p not in seen:
-            seen.add(p)
-            out.append(p)
+        resolved = _resolve_cookie_path(path)
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
 
     if _is_instagram_url(url):
         add(getattr(settings, "YTDLP_INSTAGRAM_COOKIES_FILE", None))
-        files_csv = (settings.YTDLP_COOKIES_FILES or "").strip()
-        if files_csv:
-            for part in files_csv.split(","):
-                add(part.strip())
         add(settings.YTDLP_COOKIES_FILE)
     elif _is_tiktok_url(url):
         add(getattr(settings, "YTDLP_TIKTOK_COOKIES_FILE", None))
-    else:
-        add(settings.YTDLP_COOKIES_FILE)
-        files_csv = (settings.YTDLP_COOKIES_FILES or "").strip()
-        if files_csv:
-            for part in files_csv.split(","):
-                add(part.strip())
+    elif _is_youtube_url(url):
+        add(getattr(settings, "YTDLP_YOUTUBE_COOKIES_FILE", None))
+    elif _is_pornhub_url(url):
+        add(getattr(settings, "YTDLP_PORNHUB_COOKIES_FILE", None))
+
+    files_csv = (settings.YTDLP_COOKIES_FILES or "").strip()
+    if files_csv and not _is_tiktok_url(url):
+        for part in files_csv.split(","):
+            add(part.strip())
     return out
 
 
@@ -169,12 +290,28 @@ def _is_tiktok_transient_error(message: str) -> bool:
 
 def _is_bot_challenge_error(message: str) -> bool:
     """
-    Pornhub intermittently answers with a JS anti-bot page instead of the video page;
-    yt-dlp reports that as a missing PhantomJS, since PhantomJS is what it would use
-    to run the challenge script. The challenge is not sticky, so repeating the same
-    request usually returns the real page.
+    Sites intermittently answer with a JS anti-bot / age-gate / login bounce.
+    Repeating the request (especially with phone WebView cookies) often works.
     """
-    return "phantomjs" in (message or "").lower()
+    m = (message or "").lower()
+    return (
+        "phantomjs" in m
+        or "no video formats found" in m
+        or "redirection detected" in m
+        or "sign in to confirm" in m
+        or "not a bot" in m
+        or "empty media response" in m
+        or "http error 403" in m
+        or "http error 429" in m
+        or "the page needs to be reloaded" in m
+        or "ip address is blocked" in m
+        or _is_tiktok_transient_error(message)
+    )
+
+
+def _is_proxy_rotatable_error(message: str) -> bool:
+    """True when another exit IP is more likely to succeed than cookies or ffmpeg."""
+    return _is_bot_challenge_error(message) or "unable to extract" in (message or "").lower()
 
 
 class _YtdlpQuietLogger:
@@ -289,7 +426,14 @@ def _cookie_setup_hint() -> str:
 def _youtube_ytdlp_opts() -> Dict[str, Any]:
     """
     YouTube needs yt-dlp-ejs (pip) and preferably Deno for JS challenge solving.
-    Without EJS, YouTube often falls back to 360p-only SABR formats.
+
+    Do not pin player_client to web/android/ios. Those clients are SABR-only or
+    require a PO token, so yt-dlp silently drops every format above 360p.
+    yt-dlp's default client set (tv_embedded / mweb / etc.) still returns
+    720p–4K without a token.
+
+    Do not curl_cffi-impersonate YouTube when using exported cookies — that
+    combo makes yt-dlp report "The page needs to be reloaded".
     """
     opts: Dict[str, Any] = {
         "remote_components": ["ejs:github"],
@@ -305,8 +449,8 @@ def _youtube_ytdlp_opts() -> Dict[str, Any]:
 def _platform_ytdlp_opts(url: str) -> Dict[str, Any]:
     """
     Extra yt-dlp options for platforms with anti-bot / JS challenges.
-    TikTok: request pacing; curl-cffi (optional dep) enables automatic impersonation.
-    YouTube: EJS scripts + Deno for full resolution list.
+    TikTok: Chrome 139 UA + Referer (default impersonate UA is blocked).
+    YouTube: EJS scripts + Deno; leave player_client to yt-dlp defaults.
     Adult sites: explicit browser impersonation to get past fingerprint blocking.
     """
     opts: Dict[str, Any] = {}
@@ -314,6 +458,7 @@ def _platform_ytdlp_opts(url: str) -> Dict[str, Any]:
         opts["sleep_interval_requests"] = 2
         opts["retries"] = 5
         opts["fragment_retries"] = 5
+        opts["http_headers"] = dict(_TIKTOK_WEB_HEADERS)
     if _is_youtube_url(url):
         opts.update(_youtube_ytdlp_opts())
     if _needs_impersonation(url):
@@ -454,6 +599,7 @@ class YtDlpDownloader(BaseDownloader):
         runner: Callable[[Dict[str, Any]], Any],
         *,
         op_name: str,
+        cookiefile: Optional[str] = None,
     ) -> Any:
         """
         For Instagram/TikTok: try cookie files, then browser profiles, then no cookies.
@@ -469,32 +615,64 @@ class YtDlpDownloader(BaseDownloader):
         if base_work.get("logger") is None:
             base_work["logger"] = _YtdlpQuietLogger(self.logger)
 
+        proxy_chain = _ordered_proxies()
+        pool_size = len(_proxy_pool())
+        if proxy_chain and proxy_chain[0] is not None:
+            self.logger.info(
+                "yt-dlp %s: using %s/%s HTTP proxy(ies), starting at %s for url=%s",
+                op_name,
+                len(proxy_chain),
+                pool_size,
+                _proxy_label(proxy_chain[0]),
+                url,
+            )
+
         def _attempt(opts: Dict[str, Any]) -> Any:
-            # Both TikTok and the impersonated adult sites fail intermittently on
-            # anti-bot challenges that clear on a repeat request.
-            max_tries = 3 if (_is_tiktok_url(url) or _needs_impersonation(url)) else 1
+            # Rotate exit IPs on anti-bot / empty-format responses. A short inner
+            # retry still helps TikTok and adult sites when the same proxy flakes.
+            inner_tries = 2 if (_is_tiktok_url(url) or _needs_impersonation(url)) else 1
             last: Optional[BaseException] = None
-            for attempt in range(max_tries):
-                try:
-                    return runner(opts)
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                    last = e
-                    if attempt + 1 < max_tries and (
-                        _is_tiktok_transient_error(str(e))
-                        or _is_bot_challenge_error(str(e))
-                    ):
-                        wait = 1 + attempt
-                        self.logger.info(
-                            "yt-dlp %s: transient anti-bot response, retry %s/%s in %ss for url=%s",
-                            op_name,
-                            attempt + 2,
-                            max_tries,
-                            wait,
-                            url,
+            for proxy_i, proxy in enumerate(proxy_chain):
+                work = dict(opts)
+                _apply_proxy(work, proxy)
+                for attempt in range(inner_tries):
+                    try:
+                        return runner(work)
+                    except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                        last = e
+                        msg = str(e)
+                        if _is_non_cookie_failure(msg):
+                            raise
+                        more_inner = attempt + 1 < inner_tries and _is_bot_challenge_error(msg)
+                        if more_inner:
+                            wait = 1 + attempt
+                            self.logger.info(
+                                "yt-dlp %s: transient anti-bot via %s, retry %s/%s in %ss for url=%s",
+                                op_name,
+                                _proxy_label(proxy),
+                                attempt + 2,
+                                inner_tries,
+                                wait,
+                                url,
+                            )
+                            time.sleep(wait)
+                            continue
+                        more_proxies = (
+                            proxy_i + 1 < len(proxy_chain)
+                            and _is_proxy_rotatable_error(msg)
                         )
-                        time.sleep(wait)
-                        continue
-                    raise
+                        if more_proxies:
+                            nxt = proxy_chain[proxy_i + 1]
+                            self.logger.info(
+                                "yt-dlp %s: %s failed via %s, rotating to %s for url=%s",
+                                op_name,
+                                _short_err(msg),
+                                _proxy_label(proxy),
+                                _proxy_label(nxt),
+                                url,
+                            )
+                            break
+                        raise
             if last:
                 raise last
             raise RuntimeError("attempt failed without exception")
@@ -570,108 +748,71 @@ class YtDlpDownloader(BaseDownloader):
                         )
             raise last_err or yt_dlp.utils.DownloadError("no browser cookies worked")
 
-        if _url_prefers_login_cookies(url):
-            cookie_files = _cookie_file_pool(url)
+        def _try_client_cookies() -> Any:
+            if not cookiefile or not os.path.isfile(cookiefile):
+                raise yt_dlp.utils.DownloadError("no client cookiefile")
+            opts = dict(base_work)
+            _apply_cookie_options(opts, url, cookiefile_override=cookiefile)
+            self.logger.info(
+                "yt-dlp %s: trying phone WebView cookies for url=%s", op_name, url
+            )
+            return _attempt(opts)
 
-            # TikTok public videos work without cookies; IG cookies must not be sent.
-            if _is_tiktok_url(url):
-                try:
-                    return _try_without_cookies(final=False)
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    pass
-                for cf in cookie_files:
-                    opts = dict(base_work)
-                    _apply_cookie_options(opts, url, cookiefile_override=cf)
-                    try:
-                        self.logger.info(
-                            "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
-                        )
-                        return _attempt(opts)
-                    except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                        last_err = e
-                        _raise_if_non_cookie_failure(e)
-                        self.logger.warning(
-                            "yt-dlp %s failed with cookie file %s for url=%s: %s",
-                            op_name,
-                            cf,
-                            url,
-                            e,
-                        )
-                try:
-                    return _try_browser_cookies()
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    pass
-                try:
-                    return _try_without_cookies(final=True)
-                except ValueError:
-                    raise
-                except Exception as e:
-                    self.logger.exception("yt-dlp %s failed for url=%s", op_name, url)
-                    raise RuntimeError(f"Failed to {op_name}: {e}") from e
-
-            for cf in cookie_files:
-                opts = dict(base_work)
-                _apply_cookie_options(opts, url, cookiefile_override=cf)
-                try:
-                    self.logger.info("yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url)
-                    return _attempt(opts)
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                    last_err = e
-                    _raise_if_non_cookie_failure(e)
-                    self.logger.warning(
-                        "yt-dlp %s failed with cookie file %s for url=%s: %s",
-                        op_name,
-                        cf,
-                        url,
-                        e,
-                    )
-
+        if cookiefile and os.path.isfile(cookiefile):
             try:
-                return _try_browser_cookies()
+                return _try_client_cookies()
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                last_err = e
+                self.logger.info(
+                    "yt-dlp %s: phone cookies did not unlock url=%s; trying other strategies",
+                    op_name,
+                    url,
+                )
+
+        cookie_files = _cookie_file_pool(url)
+        proxies_on = bool(_proxy_pool())
+
+        # Public TikTok/YouTube work better without IP-bound cookies. Proxies plus
+        # a cookie file exported from a different IP often trigger bot checks.
+        if _is_tiktok_url(url) or (_is_youtube_url(url) and proxies_on):
+            try:
+                return _try_without_cookies(final=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
 
+        for cf in cookie_files:
+            opts = dict(base_work)
+            _apply_cookie_options(opts, url, cookiefile_override=cf)
             try:
-                return _try_without_cookies(final=True)
-            except ValueError:
-                raise
-            except Exception as e:
-                self.logger.exception("yt-dlp %s failed for url=%s", op_name, url)
-                raise RuntimeError(f"Failed to {op_name}: {e}") from e
+                self.logger.info(
+                    "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
+                )
+                return _attempt(opts)
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                last_err = e
+                _raise_if_non_cookie_failure(e)
+                self.logger.warning(
+                    "yt-dlp %s failed with cookie file %s for url=%s: %s",
+                    op_name,
+                    cf,
+                    url,
+                    e,
+                )
 
-        opts = dict(base_work)
-        _apply_cookie_options(opts, url)
         try:
-            # _attempt, not runner: this is the path every non-Instagram/TikTok URL
-            # takes, so it needs the anti-bot retry too.
-            return _attempt(opts)
-        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-            err_msg = str(e)
-            if _is_browser_cookie_database_error(err_msg) and os.name == "nt":
-                for browser in ("edge", "firefox", "brave"):
-                    opts2 = dict(base_work)
-                    opts2.pop("cookiefile", None)
-                    opts2.pop("cookiesfrombrowser", None)
-                    opts2["cookiesfrombrowser"] = (browser,)
-                    try:
-                        self.logger.info(
-                            "yt-dlp %s: Chrome cookie DB locked; retrying with browser=%s for url=%s",
-                            op_name,
-                            browser,
-                            url,
-                        )
-                        return _attempt(opts2)
-                    except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                        continue
-            last_err = e
-            friendly = _friendly_extract_error(url, e, dpapi_seen=dpapi_seen)
-            self.logger.warning("yt-dlp %s failed for url=%s: %s", op_name, url, friendly)
-            raise ValueError(friendly) from e
+            return _try_browser_cookies()
+        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
+            pass
+
+        try:
+            return _try_without_cookies(final=True)
+        except ValueError:
+            raise
         except Exception as e:
             self.logger.exception("yt-dlp %s failed for url=%s", op_name, url)
             raise RuntimeError(f"Failed to {op_name}: {e}") from e
 
-    def extract_info(self, url: str) -> Dict[str, Any]:
+    def extract_info(self, url: str, cookiefile: Optional[str] = None) -> Dict[str, Any]:
         """
         Calls yt-dlp with download=False to retrieve metadata.
         """
@@ -687,9 +828,10 @@ class YtDlpDownloader(BaseDownloader):
             base_opts,
             lambda o: self._extract_info_impl(url, o),
             op_name="extract_info",
+            cookiefile=cookiefile,
         )
 
-    def extract_playlist(self, url: str) -> Dict[str, Any]:
+    def extract_playlist(self, url: str, cookiefile: Optional[str] = None) -> Dict[str, Any]:
         """
         Extract high-level playlist information (entries) without downloading.
         """
@@ -706,6 +848,7 @@ class YtDlpDownloader(BaseDownloader):
             base_opts,
             lambda o: self._extract_playlist_impl(url, o),
             op_name="extract_playlist",
+            cookiefile=cookiefile,
         )
 
     def list_formats(self, info: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -723,6 +866,7 @@ class YtDlpDownloader(BaseDownloader):
         format_id: str,
         output_path: str,
         progress_cb: Callable[[Dict[str, Any]], None],
+        cookiefile: Optional[str] = None,
     ) -> str:
         """
         Downloads a specific format using yt-dlp. For quality-based ids (e.g. "720",
@@ -769,6 +913,7 @@ class YtDlpDownloader(BaseDownloader):
                 base_opts,
                 lambda o: self._download_impl(url, o),
                 op_name="download",
+                cookiefile=cookiefile,
             )
             if resolved_path:
                 return resolved_path[-1]

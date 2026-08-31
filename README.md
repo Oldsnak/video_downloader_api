@@ -79,6 +79,14 @@ CORS_ORIGINS=*
 #
 # ffmpeg merges separate YouTube video/audio streams — set FFMPEG_PATH if not on PATH:
 # FFMPEG_PATH=C:\ProgramData\chocolatey\bin\ffmpeg.exe
+
+# HTTP proxies for yt-dlp (Webshare or similar). Used for every extract/download.
+# Do not commit credentials. Prefer split user/password/endpoints in Codespaces secrets.
+# YTDLP_PROXY_USER=webshare_user
+# YTDLP_PROXY_PASSWORD=webshare_password
+# YTDLP_PROXY_ENDPOINTS=ip:port,ip:port
+# Or a single CSV of full URLs:
+# YTDLP_PROXIES=http://user:pass@ip:port,http://user:pass@ip2:port2
 ```
 
 ## Running the worker (concurrent downloads)

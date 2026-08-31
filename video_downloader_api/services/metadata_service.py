@@ -63,7 +63,7 @@ class MetadataService:
         self.detector = detector
         self.logger = get_logger(self.__class__.__name__)
 
-    def validate_and_extract(self, url: str, allowed_domains: List[str]) -> Tuple[str, str, Dict[str, Any]]:
+    def validate_and_extract(self, url: str, allowed_domains: List[str], cookiefile: Optional[str] = None) -> Tuple[str, str, Dict[str, Any]]:
         """
         Pipeline:
         - normalize url
@@ -80,11 +80,11 @@ class MetadataService:
             raise ValueError("Domain is not allowed.")
 
         platform = self.detector.detect_platform(normalized)
-        info = self.downloader.extract_info(normalized)
+        info = self.downloader.extract_info(normalized, cookiefile=cookiefile)
         return platform, normalized, info
 
     def validate_and_extract_playlist(
-        self, url: str, allowed_domains: List[str]
+        self, url: str, allowed_domains: List[str], cookiefile: Optional[str] = None
     ) -> Tuple[str, str, Dict[str, Any]]:
         """
         Same as [validate_and_extract] but keeps playlist structure (no noplaylist)
@@ -96,17 +96,21 @@ class MetadataService:
             raise ValueError("Domain is not allowed.")
 
         platform = self.detector.detect_platform(normalized)
-        info = self.downloader.extract_playlist(normalized)
+        info = self.downloader.extract_playlist(normalized, cookiefile=cookiefile)
         return platform, normalized, info
 
-    def get_video_info(self, url: str, allowed_domains: List[str]) -> VideoInfoOut:
+    def get_video_info(
+        self, url: str, allowed_domains: List[str], cookiefile: Optional[str] = None
+    ) -> VideoInfoOut:
         """
         Returns clean API response containing video metadata + one format per quality.
         Deduplicates YouTube/Instagram formats (no more 3 sizes per 720p). Prefers
         merged (video+audio) formats; for separate streams we use format_id = height
         so the downloader merges bestvideo+bestaudio at download time.
         """
-        platform, normalized_url, info = self.validate_and_extract(url, allowed_domains)
+        platform, normalized_url, info = self.validate_and_extract(
+            url, allowed_domains, cookiefile=cookiefile
+        )
 
         title = info.get("title")
         duration = info.get("duration")
@@ -215,13 +219,17 @@ class MetadataService:
             formats=formats_out,
         )
 
-    def get_playlist_info(self, url: str, allowed_domains: List[str]) -> PlaylistInfoOut:
+    def get_playlist_info(
+        self, url: str, allowed_domains: List[str], cookiefile: Optional[str] = None
+    ) -> PlaylistInfoOut:
         """
         Returns metadata for all videos in a playlist URL.
         Internally reuses [get_video_info] for each entry so the response shape
         matches the single-video API (VideoInfoOut per item).
         """
-        platform, normalized_url, info = self.validate_and_extract_playlist(url, allowed_domains)
+        platform, normalized_url, info = self.validate_and_extract_playlist(
+            url, allowed_domains, cookiefile=cookiefile
+        )
 
         title = info.get("title")
         entries = info.get("entries") or []
@@ -235,7 +243,9 @@ class MetadataService:
                 if not entry_url:
                     continue
                 try:
-                    vinfo = self.get_video_info(str(entry_url), allowed_domains)
+                    vinfo = self.get_video_info(
+                        str(entry_url), allowed_domains, cookiefile=cookiefile
+                    )
                     videos.append(vinfo)
                 except Exception:
                     self.logger.exception(

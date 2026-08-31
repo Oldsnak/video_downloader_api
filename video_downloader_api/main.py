@@ -78,6 +78,14 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(api_router, prefix=settings.API_V1_PREFIX)
+
+    @app.get("/")
+    def root() -> dict:
+        return {
+            "status": "ok",
+            "health": f"{settings.API_V1_PREFIX}/health",
+        }
+
     return app
 
 

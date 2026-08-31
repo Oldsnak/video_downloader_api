@@ -5,9 +5,25 @@ cd "$(dirname "$0")/.."
 
 export PATH="${HOME}/.deno/bin:${PATH}"
 
-if [ ! -f .env ]; then
-  cp .env.codespace .env
-fi
+# Always use the Codespace env (no Redis/Celery). A leftover .env from
+# an earlier start would otherwise leave jobs stuck in "queued".
+cp .env.codespace .env
+
+# Codespaces secrets (repo or user) override the copied file without committing
+# proxy passwords. Supported: YTDLP_PROXIES or USER+PASSWORD+ENDPOINTS.
+append_secret() {
+  local key="$1"
+  local value
+  value="$(printenv "${key}" || true)"
+  if [ -n "${value}" ]; then
+    printf '\n%s=%s\n' "${key}" "${value}" >> .env
+  fi
+}
+append_secret YTDLP_PROXIES
+append_secret YTDLP_PROXY
+append_secret YTDLP_PROXY_USER
+append_secret YTDLP_PROXY_PASSWORD
+append_secret YTDLP_PROXY_ENDPOINTS
 
 mkdir -p downloads
 

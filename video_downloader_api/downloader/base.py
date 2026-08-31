@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Any
+from typing import Callable, Dict, List, Any, Optional
 
 
 class BaseDownloader(ABC):
@@ -17,7 +17,7 @@ class BaseDownloader(ABC):
     """
 
     @abstractmethod
-    def extract_info(self, url: str) -> Dict[str, Any]:
+    def extract_info(self, url: str, cookiefile: Optional[str] = None) -> Dict[str, Any]:
         """
         Fetch video metadata without downloading.
 
@@ -49,6 +49,7 @@ class BaseDownloader(ABC):
         format_id: str,
         output_path: str,
         progress_cb: Callable[[Dict[str, Any]], None],
+        cookiefile: Optional[str] = None,
     ) -> str:
         """
         Download a specific format.

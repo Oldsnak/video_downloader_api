@@ -18,6 +18,10 @@ from video_downloader_api.schemas.download import (
     LinkCheckResponse,
 )
 from video_downloader_api.schemas.video import PlaylistInfoOut, VideoInfoOut
+from video_downloader_api.services.client_cookies import (
+    remove_cookie_file,
+    write_temp_netscape,
+)
 from video_downloader_api.services.download_service import DownloadService
 from video_downloader_api.services.metadata_service import MetadataService
 from video_downloader_api.services.platform_detector import PlatformDetector
@@ -81,7 +85,15 @@ def get_info(payload: LinkCheckRequest, db: Session = Depends(get_db)) -> VideoI
     validate_url_safe(url_str)
 
     try:
-        return metadata.get_video_info(url_str, allowed_domains=settings.ALLOWED_DOMAINS)
+        cookiefile = write_temp_netscape(payload.client_cookies)
+        try:
+            return metadata.get_video_info(
+                url_str,
+                allowed_domains=settings.ALLOWED_DOMAINS,
+                cookiefile=cookiefile,
+            )
+        finally:
+            remove_cookie_file(cookiefile)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -103,7 +115,15 @@ def get_playlist_info(payload: LinkCheckRequest, db: Session = Depends(get_db)) 
     validate_url_safe(url_str)
 
     try:
-        return metadata.get_playlist_info(url_str, allowed_domains=settings.ALLOWED_DOMAINS)
+        cookiefile = write_temp_netscape(payload.client_cookies)
+        try:
+            return metadata.get_playlist_info(
+                url_str,
+                allowed_domains=settings.ALLOWED_DOMAINS,
+                cookiefile=cookiefile,
+            )
+        finally:
+            remove_cookie_file(cookiefile)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -124,6 +144,7 @@ def start_download(payload: DownloadStartRequest, db: Session = Depends(get_db))
             url=payload.url,
             format_id=payload.format_id,
             filename_hint=payload.filename_hint,
+            client_cookies=payload.client_cookies,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

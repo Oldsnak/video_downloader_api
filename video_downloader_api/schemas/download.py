@@ -4,7 +4,19 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+
+class ClientCookieSlice(BaseModel):
+    """Cookies the phone WebView already has for this site (Codespace has none)."""
+
+    url: str = Field(..., max_length=2048)
+    header: str = Field(..., max_length=16384)
+
+    @field_validator("url", "header")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return (v or "").strip()
 
 
 class LinkCheckRequest(BaseModel):
@@ -18,6 +30,11 @@ class LinkCheckRequest(BaseModel):
         ...,
         description="Video URL pasted by the user (YouTube, Instagram, Facebook, TikTok).",
         examples=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+    )
+    client_cookies: Optional[list[ClientCookieSlice]] = Field(
+        default=None,
+        description="WebView cookie headers from the phone, used when the API host is blocked.",
+        max_length=20,
     )
 
 
@@ -57,6 +74,11 @@ class DownloadStartRequest(BaseModel):
     filename_hint: Optional[str] = Field(
         default=None,
         description="Optional filename hint without extension (used if provided).",
+    )
+    client_cookies: Optional[list[ClientCookieSlice]] = Field(
+        default=None,
+        description="WebView cookie headers from the phone, used when the API host is blocked.",
+        max_length=20,
     )
 
 

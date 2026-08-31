@@ -123,6 +123,8 @@ class Settings(BaseSettings):
     # YTDLP_TIKTOK_COOKIES_FILE=/path/to/tiktok.txt (optional, login-gated TikTok only)
     YTDLP_COOKIES_FILE: Optional[str] = Field(default=None)
     YTDLP_INSTAGRAM_COOKIES_FILE: Optional[str] = Field(default=None)
+    YTDLP_YOUTUBE_COOKIES_FILE: Optional[str] = Field(default=None)
+    YTDLP_PORNHUB_COOKIES_FILE: Optional[str] = Field(default=None)
     YTDLP_TIKTOK_COOKIES_FILE: Optional[str] = Field(default=None)
     YTDLP_COOKIES_FILES: Optional[str] = Field(default=None)
     YTDLP_COOKIES_FROM_BROWSER: Optional[str] = Field(default=None)
@@ -134,6 +136,14 @@ class Settings(BaseSettings):
     # YouTube: optional path to deno.exe for yt-dlp EJS challenge solving (recommended).
     # If unset, yt-dlp looks for deno on PATH; pip package yt-dlp-ejs is still required.
     YTDLP_DENO_PATH: Optional[str] = Field(default=None)
+    # HTTP proxies for yt-dlp (Webshare, etc.). Never commit credentials.
+    # YTDLP_PROXIES=http://user:pass@ip:port,http://user:pass@ip2:port2
+    # Or split: YTDLP_PROXY_USER / YTDLP_PROXY_PASSWORD / YTDLP_PROXY_ENDPOINTS=ip:port,ip:port
+    YTDLP_PROXY: Optional[str] = Field(default=None)
+    YTDLP_PROXIES: Optional[str] = Field(default=None)
+    YTDLP_PROXY_USER: Optional[str] = Field(default=None)
+    YTDLP_PROXY_PASSWORD: Optional[str] = Field(default=None)
+    YTDLP_PROXY_ENDPOINTS: Optional[str] = Field(default=None)
 
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_FILE_SIZE_MB: int = 2000

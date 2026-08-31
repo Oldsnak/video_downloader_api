@@ -11,7 +11,8 @@ from video_downloader_api.core.config import get_settings
 from video_downloader_api.core.logger import get_logger
 from video_downloader_api.downloader.ytdlp_downloader import YtDlpDownloader
 from video_downloader_api.repositories.job_repo import JobRepository
-from video_downloader_api.services.events_service import EventsService
+from video_downloader_api.services.client_cookies import job_cookie_path, remove_job_cookies
+from video_downloader_api.services.events_service import get_events
 from video_downloader_api.services.file_manager import FileManager
 from video_downloader_api.services.progress_service import ProgressService
 from video_downloader_api.services.storage_service import StorageService
@@ -42,8 +43,8 @@ def execute_download(job_id: str, db: Session) -> None:
     file_manager = FileManager()
 
     # NOTE: In-memory EventsService will not work across processes in real production.
-    # For now, we still publish events (useful when API+worker in same process or for future Redis pubsub).
-    events = EventsService()
+    # Same-process Codespace/dev uses the shared singleton so SSE sees these events.
+    events = get_events()
 
     # Repo factory that reuses current session/repo
     repo_factory: Callable[[], JobRepository] = lambda: repo
@@ -65,12 +66,17 @@ def execute_download(job_id: str, db: Session) -> None:
         # Cleanup old partials if any
         file_manager.cleanup_job_files(job_id=job_id, base_dir=settings.DOWNLOAD_DIR)
 
+        cookiefile = job_cookie_path(job_id)
+        if not os.path.isfile(cookiefile):
+            cookiefile = None
+
         # Download and stream progress updates through hook
         final_path = downloader.download(
             url=job.source_url,
             format_id=job.format_id or "best",
             output_path=output_path,
             progress_cb=lambda hook: progress_service.handle_hook(job_id, hook),
+            cookiefile=cookiefile,
         )
 
         # Store canonical absolute path so API and worker agree (fixes 404 when CWD differs)
@@ -90,3 +96,5 @@ def execute_download(job_id: str, db: Session) -> None:
         events.publish(job_id, {"job_id": job_id, "status": "failed", "error": str(e)})
         # Cleanup partial files on failure
         file_manager.cleanup_job_files(job_id=job_id, base_dir=settings.DOWNLOAD_DIR)
+    finally:
+        remove_job_cookies(job_id)
