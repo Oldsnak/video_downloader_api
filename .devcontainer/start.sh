@@ -25,6 +25,17 @@ append_secret YTDLP_PROXY_USER
 append_secret YTDLP_PROXY_PASSWORD
 append_secret YTDLP_PROXY_ENDPOINTS
 
+# Secrets are sometimes missing from postStart's environment. Keep the last
+# known proxy block so a restart does not drop Webshare and send YouTube
+# out the Codespace IP (instant bot check).
+if ! grep -q '^YTDLP_PROXY_ENDPOINTS=' .env && ! grep -q '^YTDLP_PROXIES=' .env; then
+  if [ -f .proxy.env ]; then
+    cat .proxy.env >> .env
+  fi
+else
+  grep -E '^YTDLP_PROXY' .env > .proxy.env || true
+fi
+
 mkdir -p downloads
 
 python -m uvicorn video_downloader_api.main:app \

@@ -31,15 +31,21 @@ def _format_selector(format_id: str, *, merge: bool = True) -> str:
     """
     format_id = (format_id or "").strip()
     if not format_id or format_id.lower() == "best":
-        # bv* includes video-only and some combined streams; required for YouTube
-        # formats that are not tagged as strict video-only.
-        return "bv*+ba/b" if merge else "best"
+        # Prefer H.264+AAC so YouTube remuxes to mp4 (no re-encode). VP9+Opus
+        # through FFmpegVideoConvertor can sit on "downloading" for a long time
+        # and then fail, which is why YouTube jobs vanished from the library.
+        return (
+            "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b" if merge else "best"
+        )
 
     match = re.match(r"^(\d+)p?$", format_id, re.IGNORECASE)
     if match:
         height = match.group(1)
         if merge:
-            return f"bv*[height<={height}]+ba/b[height<={height}]"
+            return (
+                f"bv*[vcodec^=avc1][height<={height}]+ba[acodec^=mp4a]/"
+                f"bv*[height<={height}]+ba/b[height<={height}]"
+            )
         return f"best[height<={height}]"
 
     # Unknown (e.g., TikTok single-format id): use as-is; may be a single stream
@@ -758,7 +764,12 @@ class YtDlpDownloader(BaseDownloader):
             )
             return _attempt(opts)
 
-        if cookiefile and os.path.isfile(cookiefile):
+        # YouTube cookies from the phone or a home-PC export are bound to that
+        # IP. Sending them through Webshare/Codespace is exactly what produces
+        # "Sign in to confirm you're not a bot". Public YouTube videos work
+        # cookieless via the proxy pool.
+        youtube = _is_youtube_url(url)
+        if cookiefile and os.path.isfile(cookiefile) and not youtube:
             try:
                 return _try_client_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
@@ -768,19 +779,30 @@ class YtDlpDownloader(BaseDownloader):
                     op_name,
                     url,
                 )
+        elif youtube and cookiefile:
+            self.logger.info(
+                "yt-dlp %s: skipping phone YouTube cookies (IP-bound) for url=%s",
+                op_name,
+                url,
+            )
 
         cookie_files = _cookie_file_pool(url)
-        proxies_on = bool(_proxy_pool())
 
-        # Public TikTok/YouTube work better without IP-bound cookies. Proxies plus
-        # a cookie file exported from a different IP often trigger bot checks.
-        if _is_tiktok_url(url) or (_is_youtube_url(url) and proxies_on):
+        if _is_tiktok_url(url) or youtube:
             try:
                 return _try_without_cookies(final=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
 
         for cf in cookie_files:
+            if youtube:
+                self.logger.info(
+                    "yt-dlp %s: skipping YouTube cookie file %s (IP-bound) for url=%s",
+                    op_name,
+                    cf,
+                    url,
+                )
+                continue
             opts = dict(base_work)
             _apply_cookie_options(opts, url, cookiefile_override=cf)
             try:
@@ -903,9 +925,9 @@ class YtDlpDownloader(BaseDownloader):
         }
 
         if use_merge:
-            base_opts["postprocessors"] = [
-                {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
-            ]
+            # Remux only. FFmpegVideoConvertor re-encodes VP9→H.264 and can
+            # stall or fail a YouTube job for minutes on a small Codespace CPU.
+            base_opts["merge_output_format"] = "mp4"
 
         try:
             self._run_with_cookie_fallback(

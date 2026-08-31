@@ -1,6 +1,9 @@
 .venv/
 venv/
 .env
+.proxy.env
+.codespace-public-url
+PUBLIC_API_URL.txt
 __pycache__/
 *.py[cod]
 *.egg-info/
