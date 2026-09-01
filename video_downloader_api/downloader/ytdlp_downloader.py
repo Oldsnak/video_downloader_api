@@ -984,8 +984,8 @@ class YtDlpDownloader(BaseDownloader):
             )
             return _attempt(opts)
 
-        # YouTube cookies are IP-bound (bot check). Instagram empty-media is a
-        # login wall — cookieless first, then phone WebView cookies.
+        # Owner-supplied Netscape cookies on the API host the session so app
+        # users never log in. Phone WebView cookies are optional extras.
         youtube = _is_youtube_url(url)
         instagram = _is_instagram_url(url)
         if cookiefile and youtube:
@@ -997,18 +997,39 @@ class YtDlpDownloader(BaseDownloader):
 
         cookie_files = _cookie_file_pool(url)
 
-        # Instagram login-walled reels need sessionid. Try phone cookies first
-        # when we have them; cookieless still works for public posts.
-        if instagram and cookiefile and os.path.isfile(cookiefile):
+        def _try_server_cookie_files() -> Any:
+            nonlocal last_err
+            if not cookie_files:
+                raise yt_dlp.utils.DownloadError("no server cookie file")
+            for cf in cookie_files:
+                if youtube:
+                    continue
+                opts = dict(base_work)
+                _apply_cookie_options(opts, url, cookiefile_override=cf)
+                try:
+                    self.logger.info(
+                        "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
+                    )
+                    return _attempt(opts)
+                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                    last_err = e
+                    _raise_if_non_cookie_failure(e)
+                    self.logger.warning(
+                        "yt-dlp %s failed with cookie file %s for url=%s: %s",
+                        op_name,
+                        cf,
+                        url,
+                        e,
+                    )
+            raise yt_dlp.utils.DownloadError("no server cookie file worked")
+
+        # Instagram / adult: use the API owner's cookies first so end users
+        # do not sign in inside the app.
+        if instagram or _needs_impersonation(url):
             try:
-                return _try_client_cookies()
-            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                last_err = e
-                self.logger.info(
-                    "yt-dlp %s: phone cookies did not unlock url=%s; trying cookieless",
-                    op_name,
-                    url,
-                )
+                return _try_server_cookie_files()
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
+                pass
 
         if _is_tiktok_url(url) or youtube or instagram or bool(_proxy_pool()):
             try:
@@ -1016,7 +1037,7 @@ class YtDlpDownloader(BaseDownloader):
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
 
-        if cookiefile and os.path.isfile(cookiefile) and not youtube and not instagram:
+        if cookiefile and os.path.isfile(cookiefile) and not youtube:
             try:
                 return _try_client_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
@@ -1027,32 +1048,11 @@ class YtDlpDownloader(BaseDownloader):
                     url,
                 )
 
-        for cf in cookie_files:
-            if youtube:
-                self.logger.info(
-                    "yt-dlp %s: skipping cookie file %s (IP-bound) for url=%s",
-                    op_name,
-                    cf,
-                    url,
-                )
-                continue
-            opts = dict(base_work)
-            _apply_cookie_options(opts, url, cookiefile_override=cf)
+        if not instagram and not _needs_impersonation(url):
             try:
-                self.logger.info(
-                    "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
-                )
-                return _attempt(opts)
-            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                last_err = e
-                _raise_if_non_cookie_failure(e)
-                self.logger.warning(
-                    "yt-dlp %s failed with cookie file %s for url=%s: %s",
-                    op_name,
-                    cf,
-                    url,
-                    e,
-                )
+                return _try_server_cookie_files()
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
+                pass
 
         if last_err is not None and (youtube or instagram):
             friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
