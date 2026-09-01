@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from video_downloader_api.core.config import get_settings
+from video_downloader_api.core.logger import get_logger
 from video_downloader_api.db.session import get_db
 from video_downloader_api.downloader.ytdlp_downloader import YtDlpDownloader
 from video_downloader_api.middleware.auth import verify_api_key
@@ -28,6 +29,7 @@ from video_downloader_api.services.platform_detector import PlatformDetector
 from video_downloader_api.services.storage_service import StorageService
 
 router = APIRouter(prefix="/download")
+_log = get_logger("download.route")
 
 
 def _build_services(db: Session):
@@ -85,6 +87,8 @@ def get_info(payload: LinkCheckRequest, db: Session = Depends(get_db)) -> VideoI
     validate_url_safe(url_str)
 
     try:
+        n_cookies = len(payload.client_cookies or [])
+        _log.info("download/info url=%s client_cookies=%s", url_str, n_cookies)
         cookiefile = write_temp_netscape(payload.client_cookies)
         try:
             return metadata.get_video_info(

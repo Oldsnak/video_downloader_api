@@ -997,13 +997,26 @@ class YtDlpDownloader(BaseDownloader):
 
         cookie_files = _cookie_file_pool(url)
 
+        # Instagram login-walled reels need sessionid. Try phone cookies first
+        # when we have them; cookieless still works for public posts.
+        if instagram and cookiefile and os.path.isfile(cookiefile):
+            try:
+                return _try_client_cookies()
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                last_err = e
+                self.logger.info(
+                    "yt-dlp %s: phone cookies did not unlock url=%s; trying cookieless",
+                    op_name,
+                    url,
+                )
+
         if _is_tiktok_url(url) or youtube or instagram or bool(_proxy_pool()):
             try:
                 return _try_without_cookies(final=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
 
-        if cookiefile and os.path.isfile(cookiefile) and not youtube:
+        if cookiefile and os.path.isfile(cookiefile) and not youtube and not instagram:
             try:
                 return _try_client_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
@@ -1041,7 +1054,7 @@ class YtDlpDownloader(BaseDownloader):
                     e,
                 )
 
-        if youtube and last_err is not None:
+        if last_err is not None and (youtube or instagram):
             friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
             raise ValueError(friendly) from last_err
 
