@@ -26,7 +26,9 @@ from video_downloader_api.downloader.base import BaseDownloader
 _QUALITY_PATTERN = re.compile(r"^(?:best|\d+p?)$", re.IGNORECASE)
 
 
-def _format_selector(format_id: str, *, merge: bool = True) -> str:
+def _format_selector(
+    format_id: str, *, merge: bool = True, youtube: bool = False
+) -> str:
     """
     Build yt-dlp format string.
     With ffmpeg: merge best video + audio (YouTube/Instagram quality picks).
@@ -34,9 +36,15 @@ def _format_selector(format_id: str, *, merge: bool = True) -> str:
     """
     format_id = (format_id or "").strip()
     if not format_id or format_id.lower() == "best":
-        # Prefer H.264+AAC so YouTube remuxes to mp4 (no re-encode). VP9+Opus
-        # through FFmpegVideoConvertor can sit on "downloading" for a long time
-        # and then fail, which is why YouTube jobs vanished from the library.
+        if youtube and merge:
+            # HLS/progressive first. DASH avc1 itags 403 on googlevideo through
+            # Webshare even when the watch page extract succeeded.
+            return (
+                "bv*[protocol^=m3u8]+ba/"
+                "b[protocol^=m3u8]/"
+                "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
+                "bv*+ba/b"
+            )
         return (
             "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b" if merge else "best"
         )
@@ -45,6 +53,13 @@ def _format_selector(format_id: str, *, merge: bool = True) -> str:
     if match:
         height = match.group(1)
         if merge:
+            if youtube:
+                return (
+                    f"bv*[protocol^=m3u8][height<={height}]+ba/"
+                    f"b[protocol^=m3u8][height<={height}]/"
+                    f"bv*[vcodec^=avc1][height<={height}]+ba[acodec^=mp4a]/"
+                    f"bv*[height<={height}]+ba/b[height<={height}]"
+                )
             return (
                 f"bv*[vcodec^=avc1][height<={height}]+ba[acodec^=mp4a]/"
                 f"bv*[height<={height}]+ba/b[height<={height}]"
@@ -93,6 +108,8 @@ def _is_youtube_url(url: str) -> bool:
 # makes yt-dlp report "The page needs to be reloaded".
 # TikTok must NOT get an extra ImpersonateTarget("chrome"): curl_cffi then
 # sends a Chrome 140–149 UA, and TikTok returns a bot page instead of the video.
+# Instagram GraphQL often returns empty media under Chrome impersonate; the
+# mobile web UA + phone cookies work better.
 _IMPERSONATE_DOMAINS = (
     "pornhub.com",
     "pornhub.org",
@@ -102,7 +119,6 @@ _IMPERSONATE_DOMAINS = (
     "xvideos.com",
     "desitales2.com",
     "darkero.com",
-    "instagram.com",
 )
 
 # TikTok currently blocks the Chrome 140–149 UA window that curl_cffi impersonate
@@ -113,6 +129,15 @@ _TIKTOK_WEB_HEADERS = {
         "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
     ),
     "Referer": "https://www.tiktok.com/",
+}
+
+_INSTAGRAM_WEB_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+    ),
+    "X-IG-App-ID": "936619743392459",
+    "Referer": "https://www.instagram.com/",
 }
 
 
@@ -310,7 +335,7 @@ def _forget_working_proxy(url: str, proxy: Optional[str]) -> None:
 # Cloudflare quick tunnels abort the origin at 120s. Extract must finish
 # well under that, so we cap how many exit IPs /info will walk.
 _MAX_EXTRACT_PROXY_ATTEMPTS = 4
-_MAX_DOWNLOAD_PROXY_ATTEMPTS = 6
+_MAX_DOWNLOAD_PROXY_ATTEMPTS = 10
 
 
 def _ordered_proxies(url: str = "", *, for_download: bool = False) -> List[Optional[str]]:
@@ -608,14 +633,17 @@ def _youtube_ytdlp_opts() -> Dict[str, Any]:
 
     Do not pin player_client to web/android/ios. Those clients are SABR-only or
     require a PO token, so yt-dlp silently drops every format above 360p.
-    yt-dlp's default client set (tv_embedded / mweb / etc.) still returns
-    720p–4K without a token.
-
-    Do not curl_cffi-impersonate YouTube when using exported cookies — that
-    combo makes yt-dlp report "The page needs to be reloaded".
+    TV / tv_embedded / web_safari still return real media URLs (not SABR) so
+    the googlevideo fetch does not 403 after a successful /info.
     """
     opts: Dict[str, Any] = {
         "remote_components": ["ejs:github"],
+        "hls_prefer_native": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv", "tv_embedded", "web_safari"],
+            }
+        },
     }
     deno = _deno_executable()
     if deno:
@@ -629,7 +657,8 @@ def _platform_ytdlp_opts(url: str) -> Dict[str, Any]:
     """
     Extra yt-dlp options for platforms with anti-bot / JS challenges.
     TikTok: Chrome 139 UA + Referer (default impersonate UA is blocked).
-    YouTube: EJS scripts + Deno; leave player_client to yt-dlp defaults.
+    YouTube: EJS scripts + Deno; TV clients so media URLs are actually fetchable.
+    Instagram: mobile web UA (Chrome impersonate returns empty media).
     Adult sites: explicit browser impersonation to get past fingerprint blocking.
     """
     opts: Dict[str, Any] = {}
@@ -638,6 +667,8 @@ def _platform_ytdlp_opts(url: str) -> Dict[str, Any]:
         opts["retries"] = 5
         opts["fragment_retries"] = 5
         opts["http_headers"] = dict(_TIKTOK_WEB_HEADERS)
+    if _is_instagram_url(url):
+        opts["http_headers"] = dict(_INSTAGRAM_WEB_HEADERS)
     if _is_youtube_url(url):
         opts.update(_youtube_ytdlp_opts())
     if _needs_impersonation(url):
@@ -765,10 +796,6 @@ class YtDlpDownloader(BaseDownloader):
 
     def _download_impl(self, url: str, ydl_opts: Dict[str, Any]) -> None:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if info:
-                ydl.process_ie_result(info, download=True)
-                return
             ydl.download([url])
 
     def _run_with_cookie_fallback(
@@ -957,13 +984,26 @@ class YtDlpDownloader(BaseDownloader):
             )
             return _attempt(opts)
 
-        # Phone/export cookies are bound to that device's IP. Replaying them
-        # through Webshare is what produces YouTube bot checks and Instagram
-        # "empty media response". Public videos work cookieless via the pool.
+        # YouTube cookies are IP-bound (bot check). Instagram empty-media is a
+        # login wall — cookieless first, then phone WebView cookies.
         youtube = _is_youtube_url(url)
-        proxies_on = bool(_proxy_pool())
-        skip_foreign_cookies = proxies_on or youtube
-        if cookiefile and os.path.isfile(cookiefile) and not skip_foreign_cookies:
+        instagram = _is_instagram_url(url)
+        if cookiefile and youtube:
+            self.logger.info(
+                "yt-dlp %s: skipping phone YouTube cookies (IP-bound) for url=%s",
+                op_name,
+                url,
+            )
+
+        cookie_files = _cookie_file_pool(url)
+
+        if _is_tiktok_url(url) or youtube or instagram or bool(_proxy_pool()):
+            try:
+                return _try_without_cookies(final=False)
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
+                pass
+
+        if cookiefile and os.path.isfile(cookiefile) and not youtube:
             try:
                 return _try_client_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
@@ -973,23 +1013,9 @@ class YtDlpDownloader(BaseDownloader):
                     op_name,
                     url,
                 )
-        elif cookiefile and skip_foreign_cookies:
-            self.logger.info(
-                "yt-dlp %s: skipping phone cookies (IP-bound) for url=%s",
-                op_name,
-                url,
-            )
-
-        cookie_files = _cookie_file_pool(url)
-
-        if _is_tiktok_url(url) or youtube or proxies_on:
-            try:
-                return _try_without_cookies(final=False)
-            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                pass
 
         for cf in cookie_files:
-            if skip_foreign_cookies:
+            if youtube:
                 self.logger.info(
                     "yt-dlp %s: skipping cookie file %s (IP-bound) for url=%s",
                     op_name,
@@ -1015,17 +1041,15 @@ class YtDlpDownloader(BaseDownloader):
                     e,
                 )
 
-        if not skip_foreign_cookies:
+        if youtube and last_err is not None:
+            friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
+            raise ValueError(friendly) from last_err
+
+        if not youtube:
             try:
                 return _try_browser_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
-
-        if skip_foreign_cookies and last_err is not None:
-            # Cookieless + proxy already walked the capped pool. A second pass
-            # is what pushed /info past Cloudflare's 120s read timeout.
-            friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
-            raise ValueError(friendly) from last_err
 
         try:
             return _try_without_cookies(final=True)
@@ -1111,7 +1135,9 @@ class YtDlpDownloader(BaseDownloader):
             except Exception:
                 self.logger.exception("Progress callback failed (job may still continue).")
 
-        format_selector = _format_selector(format_id, merge=_ffmpeg_available())
+        format_selector = _format_selector(
+            format_id, merge=_ffmpeg_available(), youtube=_is_youtube_url(url)
+        )
         use_merge = _is_quality_selector(format_id) and _ffmpeg_available()
 
         base_opts: Dict[str, Any] = {
