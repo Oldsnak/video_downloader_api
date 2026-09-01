@@ -721,6 +721,17 @@ def _cookie_setup_hint() -> str:
     )
 
 
+# Which YouTube client survives the bot wall changes per video and per exit IP:
+# the Rick Astley video only answered yt-dlp's default set, while Q4HMs81NQ2w
+# answered web_embedded and refused the rest. Walking a short ladder recovers
+# videos that any single client cannot fetch. None means yt-dlp's own default.
+_YOUTUBE_CLIENT_LADDER: Tuple[Optional[Tuple[str, ...]], ...] = (
+    None,
+    ("web_embedded", "mweb"),
+    ("tv_embedded",),
+)
+
+
 def _youtube_ytdlp_opts() -> Dict[str, Any]:
     """
     YouTube needs yt-dlp-ejs (pip) and preferably Deno for JS challenge solving.
@@ -929,6 +940,10 @@ class YtDlpDownloader(BaseDownloader):
             base_work["logger"] = _YtdlpQuietLogger(self.logger)
 
         proxy_chain = _ordered_proxies(url, for_download=is_download)
+        if _is_youtube_url(url) and not is_download and len(proxy_chain) > 2:
+            # The client ladder multiplies attempts, and /info still has to
+            # answer inside Cloudflare's 120s origin timeout.
+            proxy_chain = proxy_chain[:2]
         pool_size = len(_proxy_pool())
         if proxy_chain and proxy_chain[0] is not None:
             self.logger.info(
@@ -1012,26 +1027,44 @@ class YtDlpDownloader(BaseDownloader):
 
         def _try_without_cookies(*, final: bool) -> Any:
             nonlocal last_err, session_expired
-            opts = dict(base_work)
-            opts.pop("cookiefile", None)
-            opts.pop("cookiesfrombrowser", None)
-            self.logger.info("yt-dlp %s: trying without cookies for url=%s", op_name, url)
-            try:
-                return _attempt(opts)
-            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                last_err = e
-                if final:
-                    friendly = _friendly_extract_error(
-                        url, e, dpapi_seen=dpapi_seen, session_expired=session_expired
-                    )
-                    self.logger.warning(
-                        "yt-dlp %s failed (no cookies) for url=%s: %s", op_name, url, friendly
-                    )
-                    raise ValueError(friendly) from e
-                self.logger.debug(
-                    "yt-dlp %s failed without cookies for url=%s: %s", op_name, url, e
+            profiles = _YOUTUBE_CLIENT_LADDER if youtube else (None,)
+            for index, clients in enumerate(profiles):
+                opts = dict(base_work)
+                opts.pop("cookiefile", None)
+                opts.pop("cookiesfrombrowser", None)
+                if clients:
+                    opts["extractor_args"] = {
+                        "youtube": {"player_client": list(clients)}
+                    }
+                self.logger.info(
+                    "yt-dlp %s: trying without cookies (client=%s) for url=%s",
+                    op_name,
+                    ",".join(clients) if clients else "default",
+                    url,
                 )
-                raise
+                more_profiles = index + 1 < len(profiles)
+                try:
+                    return _attempt(opts)
+                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                    last_err = e
+                    if more_profiles and _is_bot_challenge_error(str(e)):
+                        continue
+                    if final:
+                        friendly = _friendly_extract_error(
+                            url, e, dpapi_seen=dpapi_seen, session_expired=session_expired
+                        )
+                        self.logger.warning(
+                            "yt-dlp %s failed (no cookies) for url=%s: %s",
+                            op_name,
+                            url,
+                            friendly,
+                        )
+                        raise ValueError(friendly) from e
+                    self.logger.debug(
+                        "yt-dlp %s failed without cookies for url=%s: %s", op_name, url, e
+                    )
+                    raise
+            raise last_err or yt_dlp.utils.DownloadError("no client worked")
 
         def _try_browser_cookies() -> Any:
             nonlocal last_err, dpapi_seen
