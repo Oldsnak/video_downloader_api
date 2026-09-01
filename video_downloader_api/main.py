@@ -56,6 +56,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("⚠️ Migration (title column) skipped or failed: %s", e)
 
+    # ✅ A restart kills in-flight download threads; without this the app polls
+    # those jobs as "Downloading" forever instead of offering a retry.
+    try:
+        from video_downloader_api.db.session import SessionLocal
+        from video_downloader_api.repositories.job_repo import JobRepository
+
+        db = SessionLocal()
+        try:
+            stale = JobRepository(db).fail_interrupted_jobs(
+                "Download stopped because the server restarted. Please try again."
+            )
+        finally:
+            db.close()
+        if stale:
+            logger.info("✅ Released %s interrupted job(s).", stale)
+    except Exception as e:
+        logger.exception("⚠️ Could not release interrupted jobs: %s", e)
+
     yield
 
     logger.info("👋 Shutting down...")

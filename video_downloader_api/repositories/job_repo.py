@@ -58,6 +58,28 @@ class JobRepository:
         stmt = select(DownloadJob).where(DownloadJob.id == job_id)
         return self.db.execute(stmt).scalars().first()
 
+    def fail_interrupted_jobs(self, message: str) -> int:
+        """
+        Mark jobs that were still running when the process stopped as failed.
+
+        Downloads run in daemon threads, so a restart kills them with no way to
+        resume. Their rows stayed "queued"/"downloading" forever and the app
+        kept polling them as active, which is why old downloads sat at 1% and
+        could never be retried.
+        """
+        stmt = select(DownloadJob).where(
+            DownloadJob.status.in_(("queued", "downloading"))
+        )
+        jobs = list(self.db.execute(stmt).scalars())
+        for job in jobs:
+            job.status = "failed"
+            job.error = message
+            job.updated_at = utc_now()
+            self.db.add(job)
+        if jobs:
+            self.db.commit()
+        return len(jobs)
+
     def update_status(self, job_id: str, status: str, error: Optional[str] = None) -> None:
         job = self.get_job(job_id)
         if not job:
