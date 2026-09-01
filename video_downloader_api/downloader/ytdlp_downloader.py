@@ -169,20 +169,82 @@ def _proxy_pool() -> Tuple[str, ...]:
 
 _PROXY_RR_LOCK = threading.Lock()
 _PROXY_RR_INDEX = 0
-_MAX_PROXY_ATTEMPTS = 5
+_PROXY_SUCCESS_LOCK = threading.Lock()
+_PROXY_SUCCESS: Dict[str, str] = {}
 
 
-def _ordered_proxies() -> List[Optional[str]]:
-    """Round-robin start so concurrent jobs spread across the Webshare pool."""
+def _proxy_affinity_key(url: str) -> str:
+    """Stable id so /info and /start reuse the same Webshare exit IP."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host in ("youtu.be", "www.youtu.be"):
+        vid = path.strip("/").split("/", 1)[0]
+        return f"yt:{vid}" if vid else raw
+    if "youtube.com" in host:
+        qs = parsed.query
+        for part in qs.split("&"):
+            if part.startswith("v=") and len(part) > 2:
+                return f"yt:{part[2:]}"
+        if "/shorts/" in path:
+            vid = path.split("/shorts/", 1)[-1].split("/", 1)[0]
+            return f"yt:{vid}" if vid else raw
+        if "/embed/" in path:
+            vid = path.split("/embed/", 1)[-1].split("/", 1)[0]
+            return f"yt:{vid}" if vid else raw
+    return f"{host}{path.rstrip('/')}".lower()
+
+
+def _remember_working_proxy(url: str, proxy: Optional[str]) -> None:
+    if not proxy or not url:
+        return
+    key = _proxy_affinity_key(url)
+    if not key:
+        return
+    with _PROXY_SUCCESS_LOCK:
+        _PROXY_SUCCESS[key] = proxy
+
+
+def _forget_working_proxy(url: str, proxy: Optional[str]) -> None:
+    if not proxy or not url:
+        return
+    key = _proxy_affinity_key(url)
+    with _PROXY_SUCCESS_LOCK:
+        if _PROXY_SUCCESS.get(key) == proxy:
+            _PROXY_SUCCESS.pop(key, None)
+
+
+def _ordered_proxies(url: str = "") -> List[Optional[str]]:
+    """
+    Prefer the exit IP that already unlocked this video.
+
+    /info and /start used to round-robin independently, so YouTube metadata
+    came from proxy A and the file download went through proxy B (instant 403).
+    """
     pool = _proxy_pool()
     if not pool:
         return [None]
+    preferred: Optional[str] = None
+    key = _proxy_affinity_key(url) if url else ""
+    if key:
+        with _PROXY_SUCCESS_LOCK:
+            candidate = _PROXY_SUCCESS.get(key)
+        if candidate in pool:
+            preferred = candidate
     global _PROXY_RR_INDEX
     with _PROXY_RR_LOCK:
         start = _PROXY_RR_INDEX % len(pool)
-        _PROXY_RR_INDEX += 1
-    ordered = list(pool[start:] + pool[:start])
-    return ordered[:_MAX_PROXY_ATTEMPTS]
+        if preferred is None:
+            _PROXY_RR_INDEX += 1
+    rotated = list(pool[start:] + pool[:start])
+    if preferred:
+        return [preferred] + [p for p in rotated if p != preferred]
+    return rotated
 
 
 def _proxy_label(proxy: Optional[str]) -> str:
@@ -317,7 +379,21 @@ def _is_bot_challenge_error(message: str) -> bool:
 
 def _is_proxy_rotatable_error(message: str) -> bool:
     """True when another exit IP is more likely to succeed than cookies or ffmpeg."""
-    return _is_bot_challenge_error(message) or "unable to extract" in (message or "").lower()
+    m = (message or "").lower()
+    return (
+        _is_bot_challenge_error(message)
+        or "unable to extract" in m
+        or "unable to download video data" in m
+        or "timed out" in m
+        or "timeout" in m
+        or "connection reset" in m
+        or "proxy error" in m
+        or "tunnel connection" in m
+        or "eof occurred" in m
+        or "407" in m
+        or "502" in m
+        or "503" in m
+    )
 
 
 class _YtdlpQuietLogger:
@@ -618,10 +694,11 @@ class YtDlpDownloader(BaseDownloader):
         base_work = dict(base_opts)
         base_work.update(_platform_ytdlp_opts(url))
         _apply_ffmpeg_options(base_work)
+        base_work.setdefault("socket_timeout", 30)
         if base_work.get("logger") is None:
             base_work["logger"] = _YtdlpQuietLogger(self.logger)
 
-        proxy_chain = _ordered_proxies()
+        proxy_chain = _ordered_proxies(url)
         pool_size = len(_proxy_pool())
         if proxy_chain and proxy_chain[0] is not None:
             self.logger.info(
@@ -643,7 +720,9 @@ class YtDlpDownloader(BaseDownloader):
                 _apply_proxy(work, proxy)
                 for attempt in range(inner_tries):
                     try:
-                        return runner(work)
+                        result = runner(work)
+                        _remember_working_proxy(url, proxy)
+                        return result
                     except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
                         last = e
                         msg = str(e)
@@ -668,6 +747,7 @@ class YtDlpDownloader(BaseDownloader):
                             and _is_proxy_rotatable_error(msg)
                         )
                         if more_proxies:
+                            _forget_working_proxy(url, proxy)
                             nxt = proxy_chain[proxy_i + 1]
                             self.logger.info(
                                 "yt-dlp %s: %s failed via %s, rotating to %s for url=%s",
@@ -764,12 +844,13 @@ class YtDlpDownloader(BaseDownloader):
             )
             return _attempt(opts)
 
-        # YouTube cookies from the phone or a home-PC export are bound to that
-        # IP. Sending them through Webshare/Codespace is exactly what produces
-        # "Sign in to confirm you're not a bot". Public YouTube videos work
-        # cookieless via the proxy pool.
+        # Phone/export cookies are bound to that device's IP. Replaying them
+        # through Webshare is what produces YouTube bot checks and Instagram
+        # "empty media response". Public videos work cookieless via the pool.
         youtube = _is_youtube_url(url)
-        if cookiefile and os.path.isfile(cookiefile) and not youtube:
+        proxies_on = bool(_proxy_pool())
+        skip_foreign_cookies = proxies_on or youtube
+        if cookiefile and os.path.isfile(cookiefile) and not skip_foreign_cookies:
             try:
                 return _try_client_cookies()
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
@@ -779,25 +860,25 @@ class YtDlpDownloader(BaseDownloader):
                     op_name,
                     url,
                 )
-        elif youtube and cookiefile:
+        elif cookiefile and skip_foreign_cookies:
             self.logger.info(
-                "yt-dlp %s: skipping phone YouTube cookies (IP-bound) for url=%s",
+                "yt-dlp %s: skipping phone cookies (IP-bound) for url=%s",
                 op_name,
                 url,
             )
 
         cookie_files = _cookie_file_pool(url)
 
-        if _is_tiktok_url(url) or youtube:
+        if _is_tiktok_url(url) or youtube or proxies_on:
             try:
                 return _try_without_cookies(final=False)
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
                 pass
 
         for cf in cookie_files:
-            if youtube:
+            if skip_foreign_cookies:
                 self.logger.info(
-                    "yt-dlp %s: skipping YouTube cookie file %s (IP-bound) for url=%s",
+                    "yt-dlp %s: skipping cookie file %s (IP-bound) for url=%s",
                     op_name,
                     cf,
                     url,
