@@ -14,7 +14,7 @@ celery==5.6.2
 redis==7.1.1
 
 # Video downloading (keep recent — TikTok/Instagram break often)
-yt-dlp==2026.7.4
+yt-dlp==2026.8.19
 # YouTube JS challenge solver (required for resolutions above 360p)
 yt-dlp-ejs>=0.8.0
 # Browser impersonation for adult sites that reject non-browser TLS

@@ -8,12 +8,14 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from functools import lru_cache
 from logging import Logger
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import yt_dlp  # pip install yt-dlp
@@ -298,30 +300,17 @@ def _proxy_pool() -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _instagram_cookie_proxy_chain(*, for_download: bool = False) -> List[Optional[str]]:
+def _session_cookie_proxy_chain() -> List[Optional[str]]:
     """
-    Owner Netscape cookies were exported from a home browser.
+    One IP only when replaying the owner's logged-in session.
 
-    Sending that session through a random GB/JP/DE exit looks like theft and
-    Instagram returns empty media. Try the Codespace IP first, then skipped
-    (usually US) exits that match a typical home session, then the rest.
+    Retrying the same session through GB, then ES, then JP within a few seconds
+    is textbook session theft, and Instagram answers by killing the session
+    server-side. Losing it logs the whole app out until cookies are re-exported,
+    which costs far more than one failed extract, so cookie attempts never
+    rotate. Proxy rotation still applies to cookieless attempts.
     """
-    skip = _skip_country_codes()
-    all_p = list(_all_proxies())
-    hosts = [urlparse(p).hostname or "" for p in all_p]
-    _fill_country_cache(hosts)
-    preferred: List[str] = []
-    rest: List[str] = []
-    for proxy in all_p:
-        host = urlparse(proxy).hostname or ""
-        country = _COUNTRY_CACHE.get(host, "")
-        if country and country in skip:
-            preferred.append(proxy)
-        else:
-            rest.append(proxy)
-    chain: List[Optional[str]] = [None] + preferred + rest
-    limit = _MAX_DOWNLOAD_PROXY_ATTEMPTS if for_download else _MAX_EXTRACT_PROXY_ATTEMPTS
-    return chain[:limit]
+    return [None]
 
 
 _PROXY_RR_LOCK = threading.Lock()
@@ -476,6 +465,54 @@ def _resolve_cookie_path(path: Optional[str]) -> Optional[str]:
 def _url_prefers_login_cookies(url: str) -> bool:
     """Instagram / TikTok often need cookies for gated or sensitive posts."""
     return _is_instagram_url(url) or _is_tiktok_url(url)
+
+
+@contextmanager
+def _disposable_cookie_copy(path: str) -> Iterator[str]:
+    """
+    Hand yt-dlp a throwaway copy of a Netscape cookie file.
+
+    When ``cookiefile`` is set, yt-dlp writes the whole jar back to that path as
+    it closes. Instagram answers a request it dislikes with a logout
+    ``Set-Cookie``, so yt-dlp would faithfully save a file with ``sessionid``
+    deleted and silently log the server out for every future user.
+    """
+    fd, tmp = tempfile.mkstemp(prefix="ytdlp_cookies_", suffix=".txt")
+    os.close(fd)
+    try:
+        shutil.copyfile(path, tmp)
+        yield tmp
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _cookie_file_names(path: str) -> set[str]:
+    """Cookie names in a Netscape file. Values are never read into memory."""
+    names: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_") :]
+                elif not line.strip() or line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 7 and parts[6].strip():
+                    names.add(parts[5])
+    except OSError:
+        return names
+    return names
+
+
+def _has_login_session(path: str, url: str) -> bool:
+    """True when the export actually carries a logged-in session cookie."""
+    names = _cookie_file_names(path)
+    if _is_instagram_url(url):
+        return "sessionid" in names
+    return bool(names)
 
 
 def _cookie_file_pool(url: str) -> List[str]:
@@ -722,8 +759,20 @@ def _platform_ytdlp_opts(url: str) -> Dict[str, Any]:
     return opts
 
 
-def _friendly_extract_error(url: str, err: BaseException, *, dpapi_seen: bool) -> str:
+def _friendly_extract_error(
+    url: str,
+    err: BaseException,
+    *,
+    dpapi_seen: bool,
+    session_expired: bool = False,
+) -> str:
     raw = str(err)
+    if session_expired and _is_instagram_url(url):
+        # App users never sign in, so only the API owner can fix this.
+        return (
+            "This post is private or login-only, and the server's Instagram "
+            "session has expired. Public posts still work."
+        )
     if _is_dpapi_cookie_error(raw):
         return f"Browser cookies unavailable (DPAPI). {_cookie_setup_hint()}"
     if _is_cookie_auth_error(raw):
@@ -858,6 +907,7 @@ class YtDlpDownloader(BaseDownloader):
         """
         last_err: Optional[BaseException] = None
         dpapi_seen = False
+        session_expired = False
 
         base_work = dict(base_opts)
         base_work.update(_platform_ytdlp_opts(url))
@@ -887,8 +937,8 @@ class YtDlpDownloader(BaseDownloader):
             if is_download and (_is_tiktok_url(url) or _needs_impersonation(url)):
                 inner_tries = 2
             chain = list(proxy_chain)
-            if _is_instagram_url(url) and opts.get("cookiefile"):
-                chain = _instagram_cookie_proxy_chain(for_download=is_download)
+            if opts.get("cookiefile") and _url_prefers_login_cookies(url):
+                chain = _session_cookie_proxy_chain()
             last: Optional[BaseException] = None
             for proxy_i, proxy in enumerate(chain):
                 if proxy and not _proxy_tcp_ok(proxy):
@@ -951,7 +1001,7 @@ class YtDlpDownloader(BaseDownloader):
             raise RuntimeError("attempt failed without exception")
 
         def _try_without_cookies(*, final: bool) -> Any:
-            nonlocal last_err
+            nonlocal last_err, session_expired
             opts = dict(base_work)
             opts.pop("cookiefile", None)
             opts.pop("cookiesfrombrowser", None)
@@ -961,7 +1011,9 @@ class YtDlpDownloader(BaseDownloader):
             except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
                 last_err = e
                 if final:
-                    friendly = _friendly_extract_error(url, e, dpapi_seen=dpapi_seen)
+                    friendly = _friendly_extract_error(
+                        url, e, dpapi_seen=dpapi_seen, session_expired=session_expired
+                    )
                     self.logger.warning(
                         "yt-dlp %s failed (no cookies) for url=%s: %s", op_name, url, friendly
                     )
@@ -1045,31 +1097,43 @@ class YtDlpDownloader(BaseDownloader):
         cookie_files = _cookie_file_pool(url)
 
         def _try_server_cookie_files() -> Any:
-            nonlocal last_err
+            nonlocal last_err, session_expired
             if not cookie_files:
                 raise yt_dlp.utils.DownloadError("no server cookie file")
             for cf in cookie_files:
                 if youtube:
                     continue
-                opts = dict(base_work)
-                _apply_cookie_options(opts, url, cookiefile_override=cf)
-                if instagram:
-                    opts["http_headers"] = dict(_INSTAGRAM_DESKTOP_HEADERS)
-                try:
-                    self.logger.info(
-                        "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
-                    )
-                    return _attempt(opts)
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
-                    last_err = e
-                    _raise_if_non_cookie_failure(e)
-                    self.logger.warning(
-                        "yt-dlp %s failed with cookie file %s for url=%s: %s",
+                if not _has_login_session(cf, url):
+                    session_expired = True
+                    self.logger.error(
+                        "yt-dlp %s: cookie file %s has no login session cookie; "
+                        "re-export it while signed in, otherwise gated posts fail",
                         op_name,
                         cf,
-                        url,
-                        e,
                     )
+                    continue
+                with _disposable_cookie_copy(cf) as safe_cf:
+                    opts = dict(base_work)
+                    _apply_cookie_options(opts, url, cookiefile_override=safe_cf)
+                    if instagram:
+                        opts["http_headers"] = dict(_INSTAGRAM_DESKTOP_HEADERS)
+                    try:
+                        self.logger.info(
+                            "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
+                        )
+                        return _attempt(opts)
+                    except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
+                        last_err = e
+                        _raise_if_non_cookie_failure(e)
+                        if _is_cookie_auth_error(str(e)):
+                            session_expired = True
+                        self.logger.warning(
+                            "yt-dlp %s failed with cookie file %s for url=%s: %s",
+                            op_name,
+                            cf,
+                            url,
+                            e,
+                        )
             raise yt_dlp.utils.DownloadError("no server cookie file worked")
 
         # Instagram / adult: use the API owner's cookies first so end users
@@ -1104,7 +1168,9 @@ class YtDlpDownloader(BaseDownloader):
                 pass
 
         if last_err is not None and (youtube or instagram):
-            friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
+            friendly = _friendly_extract_error(
+                url, last_err, dpapi_seen=dpapi_seen, session_expired=session_expired
+            )
             raise ValueError(friendly) from last_err
 
         if not youtube:
