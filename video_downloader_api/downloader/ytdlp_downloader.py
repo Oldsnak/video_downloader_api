@@ -140,6 +140,17 @@ _INSTAGRAM_WEB_HEADERS = {
     "Referer": "https://www.instagram.com/",
 }
 
+# Netscape exports come from the owner's desktop browser. Pairing those
+# cookies with the mobile UA above makes Instagram return empty media.
+_INSTAGRAM_DESKTOP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+    "X-IG-App-ID": "936619743392459",
+    "Referer": "https://www.instagram.com/",
+}
+
 
 def _needs_impersonation(url: str) -> bool:
     h = _host(url)
@@ -217,8 +228,8 @@ def _proxy_tcp_ok(proxy: str) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _proxy_pool() -> Tuple[str, ...]:
-    """HTTP proxies from env. Credentials stay in settings; never log the password."""
+def _all_proxies() -> Tuple[str, ...]:
+    """Every configured HTTP proxy, including countries skipped for YouTube."""
     settings = get_settings()
     seen: set[str] = set()
     out: List[str] = []
@@ -252,6 +263,13 @@ def _proxy_pool() -> Tuple[str, ...]:
             else:
                 add(f"http://{user}:{password}@{hostport}")
 
+    return tuple(out)
+
+
+@lru_cache(maxsize=1)
+def _proxy_pool() -> Tuple[str, ...]:
+    """HTTP proxies from env. Credentials stay in settings; never log the password."""
+    out = list(_all_proxies())
     skip = _skip_country_codes()
     if skip and out:
         hosts = [urlparse(p).hostname or "" for p in out]
@@ -278,6 +296,32 @@ def _proxy_pool() -> Tuple[str, ...]:
                 "every proxy was in a blocked country; keeping the original pool"
             )
     return tuple(out)
+
+
+def _instagram_cookie_proxy_chain(*, for_download: bool = False) -> List[Optional[str]]:
+    """
+    Owner Netscape cookies were exported from a home browser.
+
+    Sending that session through a random GB/JP/DE exit looks like theft and
+    Instagram returns empty media. Try the Codespace IP first, then skipped
+    (usually US) exits that match a typical home session, then the rest.
+    """
+    skip = _skip_country_codes()
+    all_p = list(_all_proxies())
+    hosts = [urlparse(p).hostname or "" for p in all_p]
+    _fill_country_cache(hosts)
+    preferred: List[str] = []
+    rest: List[str] = []
+    for proxy in all_p:
+        host = urlparse(proxy).hostname or ""
+        country = _COUNTRY_CACHE.get(host, "")
+        if country and country in skip:
+            preferred.append(proxy)
+        else:
+            rest.append(proxy)
+    chain: List[Optional[str]] = [None] + preferred + rest
+    limit = _MAX_DOWNLOAD_PROXY_ATTEMPTS if for_download else _MAX_EXTRACT_PROXY_ATTEMPTS
+    return chain[:limit]
 
 
 _PROXY_RR_LOCK = threading.Lock()
@@ -353,7 +397,7 @@ def _ordered_proxies(url: str = "", *, for_download: bool = False) -> List[Optio
     if key:
         with _PROXY_SUCCESS_LOCK:
             candidate = _PROXY_SUCCESS.get(key)
-        if candidate in pool:
+        if candidate in pool or candidate in _all_proxies():
             preferred = candidate
     global _PROXY_RR_INDEX
     with _PROXY_RR_LOCK:
@@ -842,8 +886,11 @@ class YtDlpDownloader(BaseDownloader):
             inner_tries = 1
             if is_download and (_is_tiktok_url(url) or _needs_impersonation(url)):
                 inner_tries = 2
+            chain = list(proxy_chain)
+            if _is_instagram_url(url) and opts.get("cookiefile"):
+                chain = _instagram_cookie_proxy_chain(for_download=is_download)
             last: Optional[BaseException] = None
-            for proxy_i, proxy in enumerate(proxy_chain):
+            for proxy_i, proxy in enumerate(chain):
                 if proxy and not _proxy_tcp_ok(proxy):
                     self.logger.info(
                         "yt-dlp %s: skip unreachable %s for url=%s",
@@ -883,12 +930,12 @@ class YtDlpDownloader(BaseDownloader):
                             time.sleep(wait)
                             continue
                         more_proxies = (
-                            proxy_i + 1 < len(proxy_chain)
+                            proxy_i + 1 < len(chain)
                             and _is_proxy_rotatable_error(msg)
                         )
                         if more_proxies:
                             _forget_working_proxy(url, proxy)
-                            nxt = proxy_chain[proxy_i + 1]
+                            nxt = chain[proxy_i + 1]
                             self.logger.info(
                                 "yt-dlp %s: %s failed via %s, rotating to %s for url=%s",
                                 op_name,
@@ -1006,6 +1053,8 @@ class YtDlpDownloader(BaseDownloader):
                     continue
                 opts = dict(base_work)
                 _apply_cookie_options(opts, url, cookiefile_override=cf)
+                if instagram:
+                    opts["http_headers"] = dict(_INSTAGRAM_DESKTOP_HEADERS)
                 try:
                     self.logger.info(
                         "yt-dlp %s: trying cookie file %s for url=%s", op_name, cf, url
