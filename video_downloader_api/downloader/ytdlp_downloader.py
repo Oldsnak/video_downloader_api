@@ -365,6 +365,36 @@ def _forget_working_proxy(url: str, proxy: Optional[str]) -> None:
             _PROXY_SUCCESS.pop(key, None)
 
 
+_CLIENT_SUCCESS: Dict[str, Any] = {}
+_CLIENT_SUCCESS_LOCK = threading.Lock()
+
+
+def _remember_working_client(url: str, clients: Any) -> None:
+    """
+    Pin the YouTube client that just worked for this video.
+
+    /info and the download extract separately. Without this the download walks
+    the ladder from the top and can settle on a client that answers "Video
+    unavailable" for a video /info had already resolved.
+    """
+    key = _proxy_affinity_key(url) if url else ""
+    if key:
+        with _CLIENT_SUCCESS_LOCK:
+            _CLIENT_SUCCESS[key] = clients
+
+
+def _ordered_client_profiles(url: str) -> Tuple[Any, ...]:
+    ladder = list(_YOUTUBE_CLIENT_LADDER)
+    key = _proxy_affinity_key(url) if url else ""
+    if not key:
+        return tuple(ladder)
+    with _CLIENT_SUCCESS_LOCK:
+        if key not in _CLIENT_SUCCESS:
+            return tuple(ladder)
+        preferred = _CLIENT_SUCCESS[key]
+    return tuple([preferred] + [p for p in ladder if p != preferred])
+
+
 # Cloudflare quick tunnels abort the origin at 120s. Extract must finish
 # well under that, so we cap how many exit IPs /info will walk.
 _MAX_EXTRACT_PROXY_ATTEMPTS = 4
@@ -577,6 +607,23 @@ def _is_bot_challenge_error(message: str) -> bool:
         or "the page needs to be reloaded" in m
         or "ip address is blocked" in m
         or _is_tiktok_transient_error(message)
+    )
+
+
+def _is_client_rotatable_error(message: str) -> bool:
+    """
+    True when another YouTube client is worth trying.
+
+    A client that is not allowed to serve a video reports it as unavailable
+    even though a different client returns it, so that wording must not end
+    the search.
+    """
+    m = (message or "").lower()
+    return (
+        _is_bot_challenge_error(message)
+        or "video unavailable" in m
+        or "requested format is not available" in m
+        or "unable to extract" in m
     )
 
 
@@ -1027,7 +1074,7 @@ class YtDlpDownloader(BaseDownloader):
 
         def _try_without_cookies(*, final: bool) -> Any:
             nonlocal last_err, session_expired
-            profiles = _YOUTUBE_CLIENT_LADDER if youtube else (None,)
+            profiles = _ordered_client_profiles(url) if youtube else (None,)
             for index, clients in enumerate(profiles):
                 opts = dict(base_work)
                 opts.pop("cookiefile", None)
@@ -1044,10 +1091,13 @@ class YtDlpDownloader(BaseDownloader):
                 )
                 more_profiles = index + 1 < len(profiles)
                 try:
-                    return _attempt(opts)
+                    result = _attempt(opts)
+                    if youtube:
+                        _remember_working_client(url, clients)
+                    return result
                 except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as e:
                     last_err = e
-                    if more_profiles and _is_bot_challenge_error(str(e)):
+                    if more_profiles and _is_client_rotatable_error(str(e)):
                         continue
                     if final:
                         friendly = _friendly_extract_error(
