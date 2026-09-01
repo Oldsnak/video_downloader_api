@@ -144,6 +144,8 @@ class Settings(BaseSettings):
     YTDLP_PROXY_USER: Optional[str] = Field(default=None)
     YTDLP_PROXY_PASSWORD: Optional[str] = Field(default=None)
     YTDLP_PROXY_ENDPOINTS: Optional[str] = Field(default=None)
+    # Comma-separated ISO country codes to never exit through (adult sites geo-block US).
+    YTDLP_PROXY_SKIP_COUNTRIES: str = Field(default="US")
 
     MAX_CONCURRENT_DOWNLOADS: int = 3
     MAX_FILE_SIZE_MB: int = 2000

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from functools import lru_cache
 from logging import Logger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -130,6 +133,65 @@ def _normalize_proxy_url(raw: str) -> Optional[str]:
     return s
 
 
+def _skip_country_codes() -> set[str]:
+    raw = (getattr(get_settings(), "YTDLP_PROXY_SKIP_COUNTRIES", None) or "US").strip()
+    return {p.strip().upper() for p in raw.replace(";", ",").split(",") if p.strip()}
+
+
+_COUNTRY_CACHE: Dict[str, str] = {}
+_TCP_OK: Dict[str, Tuple[float, bool]] = {}
+
+
+def _fill_country_cache(hosts: List[str]) -> None:
+    missing = [h for h in hosts if h and h not in _COUNTRY_CACHE]
+    if not missing:
+        return
+    try:
+        req = urllib.request.Request(
+            "http://ip-api.com/batch?fields=query,status,countryCode",
+            data=json.dumps(missing).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            rows = json.loads(resp.read().decode())
+        if not isinstance(rows, list):
+            rows = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            query = str(row.get("query") or "")
+            if row.get("status") == "success":
+                _COUNTRY_CACHE[query] = str(row.get("countryCode") or "").upper()
+            elif query:
+                _COUNTRY_CACHE[query] = ""
+        for host in missing:
+            _COUNTRY_CACHE.setdefault(host, "")
+    except Exception as e:
+        get_logger("YtDlpDownloader").warning("proxy country lookup failed: %s", e)
+        for host in missing:
+            _COUNTRY_CACHE.setdefault(host, "")
+
+
+def _proxy_tcp_ok(proxy: str) -> bool:
+    now = time.monotonic()
+    cached = _TCP_OK.get(proxy)
+    if cached and now - cached[0] < 60:
+        return cached[1]
+    parsed = urlparse(proxy)
+    host = parsed.hostname
+    port = parsed.port or 80
+    ok = False
+    if host:
+        try:
+            with socket.create_connection((host, port), timeout=2.5):
+                ok = True
+        except OSError:
+            ok = False
+    _TCP_OK[proxy] = (now, ok)
+    return ok
+
+
+@lru_cache(maxsize=1)
 def _proxy_pool() -> Tuple[str, ...]:
     """HTTP proxies from env. Credentials stay in settings; never log the password."""
     settings = get_settings()
@@ -164,6 +226,32 @@ def _proxy_pool() -> Tuple[str, ...]:
                     add(f"http://{user}:{password}@{host}:{port}")
             else:
                 add(f"http://{user}:{password}@{hostport}")
+
+    skip = _skip_country_codes()
+    if skip and out:
+        hosts = [urlparse(p).hostname or "" for p in out]
+        _fill_country_cache(hosts)
+        kept: List[str] = []
+        dropped: List[str] = []
+        for proxy in out:
+            host = urlparse(proxy).hostname or ""
+            country = _COUNTRY_CACHE.get(host, "")
+            if country and country in skip:
+                dropped.append(f"{host}({country})")
+                continue
+            kept.append(proxy)
+        if dropped:
+            get_logger("YtDlpDownloader").info(
+                "skipping %s prox(ies) in blocked countries: %s",
+                len(dropped),
+                ", ".join(dropped),
+            )
+        if kept:
+            out = kept
+        else:
+            get_logger("YtDlpDownloader").warning(
+                "every proxy was in a blocked country; keeping the original pool"
+            )
     return tuple(out)
 
 
@@ -219,7 +307,13 @@ def _forget_working_proxy(url: str, proxy: Optional[str]) -> None:
             _PROXY_SUCCESS.pop(key, None)
 
 
-def _ordered_proxies(url: str = "") -> List[Optional[str]]:
+# Cloudflare quick tunnels abort the origin at 120s. Extract must finish
+# well under that, so we cap how many exit IPs /info will walk.
+_MAX_EXTRACT_PROXY_ATTEMPTS = 4
+_MAX_DOWNLOAD_PROXY_ATTEMPTS = 6
+
+
+def _ordered_proxies(url: str = "", *, for_download: bool = False) -> List[Optional[str]]:
     """
     Prefer the exit IP that already unlocked this video.
 
@@ -243,8 +337,11 @@ def _ordered_proxies(url: str = "") -> List[Optional[str]]:
             _PROXY_RR_INDEX += 1
     rotated = list(pool[start:] + pool[:start])
     if preferred:
-        return [preferred] + [p for p in rotated if p != preferred]
-    return rotated
+        chain = [preferred] + [p for p in rotated if p != preferred]
+    else:
+        chain = rotated
+    limit = _MAX_DOWNLOAD_PROXY_ATTEMPTS if for_download else _MAX_EXTRACT_PROXY_ATTEMPTS
+    return chain[:limit]
 
 
 def _proxy_label(proxy: Optional[str]) -> str:
@@ -694,11 +791,13 @@ class YtDlpDownloader(BaseDownloader):
         base_work = dict(base_opts)
         base_work.update(_platform_ytdlp_opts(url))
         _apply_ffmpeg_options(base_work)
-        base_work.setdefault("socket_timeout", 30)
+        is_download = op_name == "download"
+        # Keep /info inside Cloudflare's 120s origin timeout.
+        base_work["socket_timeout"] = 20 if is_download else 12
         if base_work.get("logger") is None:
             base_work["logger"] = _YtdlpQuietLogger(self.logger)
 
-        proxy_chain = _ordered_proxies(url)
+        proxy_chain = _ordered_proxies(url, for_download=is_download)
         pool_size = len(_proxy_pool())
         if proxy_chain and proxy_chain[0] is not None:
             self.logger.info(
@@ -713,9 +812,23 @@ class YtDlpDownloader(BaseDownloader):
         def _attempt(opts: Dict[str, Any]) -> Any:
             # Rotate exit IPs on anti-bot / empty-format responses. A short inner
             # retry still helps TikTok and adult sites when the same proxy flakes.
-            inner_tries = 2 if (_is_tiktok_url(url) or _needs_impersonation(url)) else 1
+            inner_tries = 1
+            if is_download and (_is_tiktok_url(url) or _needs_impersonation(url)):
+                inner_tries = 2
             last: Optional[BaseException] = None
             for proxy_i, proxy in enumerate(proxy_chain):
+                if proxy and not _proxy_tcp_ok(proxy):
+                    self.logger.info(
+                        "yt-dlp %s: skip unreachable %s for url=%s",
+                        op_name,
+                        _proxy_label(proxy),
+                        url,
+                    )
+                    _forget_working_proxy(url, proxy)
+                    last = yt_dlp.utils.DownloadError(
+                        f"proxy unreachable: {_proxy_label(proxy)}"
+                    )
+                    continue
                 work = dict(opts)
                 _apply_proxy(work, proxy)
                 for attempt in range(inner_tries):
@@ -902,10 +1015,17 @@ class YtDlpDownloader(BaseDownloader):
                     e,
                 )
 
-        try:
-            return _try_browser_cookies()
-        except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-            pass
+        if not skip_foreign_cookies:
+            try:
+                return _try_browser_cookies()
+            except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
+                pass
+
+        if skip_foreign_cookies and last_err is not None:
+            # Cookieless + proxy already walked the capped pool. A second pass
+            # is what pushed /info past Cloudflare's 120s read timeout.
+            friendly = _friendly_extract_error(url, last_err, dpapi_seen=dpapi_seen)
+            raise ValueError(friendly) from last_err
 
         try:
             return _try_without_cookies(final=True)
