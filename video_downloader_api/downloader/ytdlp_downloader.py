@@ -662,7 +662,20 @@ def _deno_executable() -> Optional[str]:
     configured = (getattr(settings, "YTDLP_DENO_PATH", None) or "").strip()
     if configured and os.path.isfile(configured):
         return configured
-    return shutil.which("deno")
+    found = shutil.which("deno")
+    if found:
+        return found
+    # deno installs itself under $HOME and is only on PATH for shells that
+    # sourced the profile. Without it YouTube's JS challenge cannot be solved,
+    # so look in the install locations instead of trusting the parent process.
+    for candidate in (
+        os.path.expanduser("~/.deno/bin/deno"),
+        "/usr/local/bin/deno",
+        "/usr/bin/deno",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -712,19 +725,16 @@ def _youtube_ytdlp_opts() -> Dict[str, Any]:
     """
     YouTube needs yt-dlp-ejs (pip) and preferably Deno for JS challenge solving.
 
-    Do not pin player_client to web/android/ios. Those clients are SABR-only or
-    require a PO token, so yt-dlp silently drops every format above 360p.
-    TV / tv_embedded / web_safari still return real media URLs (not SABR) so
-    the googlevideo fetch does not 403 after a successful /info.
+    player_client is deliberately not pinned. Naming clients explicitly makes a
+    broken one fatal: the "tv" client started answering "The page needs to be
+    reloaded" and took every download with it, while yt-dlp's own default set
+    skips a failing client and still returned formats up to 2160p. Leaving the
+    choice to yt-dlp means an upstream breakage is repaired by upgrading it
+    rather than by editing this list.
     """
     opts: Dict[str, Any] = {
         "remote_components": ["ejs:github"],
         "hls_prefer_native": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv", "tv_embedded", "web_safari"],
-            }
-        },
     }
     deno = _deno_executable()
     if deno:
